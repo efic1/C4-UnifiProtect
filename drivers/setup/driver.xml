@@ -1,1 +1,136 @@
+<devicedata>
+  <copyright>2026</copyright>
+  <creator>Efi</creator>
+  <manufacturer>Ubiquiti</manufacturer>
+  <name>UniFi Protect Setup</name>
+  <model>UniFi Protect Setup</model>
+  <created>09/20/2026</created>
+  <modified>09/20/2026</modified>
+  <version>3</version>
+  <small>devices_sm/camera.gif</small>
+  <large>devices_lg/camera.gif</large>
+  <control>lua_gen</control>
+  <controlmethod>ip</controlmethod>
+  <driver>DriverWorks</driver>
+  <combo>true</combo>
 
+  <proxies qty="1">
+    <proxy proxybindingid="5001" name="UniFi Protect Setup">unifi_protect_setup</proxy>
+  </proxies>
+
+  <config>
+    <documentation file="www/documentation.html"/>
+    <properties>
+      <property>
+        <name>Driver Version</name>
+        <type>STRING</type>
+        <readonly>true</readonly>
+        <default></default>
+      </property>
+      <property>
+        <name>Setup Status</name>
+        <type>STRING</type>
+        <readonly>true</readonly>
+        <default>Not configured</default>
+      </property>
+      <property>
+        <name>NVR Address</name>
+        <type>STRING</type>
+        <readonly>false</readonly>
+        <default></default>
+        <description>IP address of the UniFi OS console.</description>
+      </property>
+      <property>
+        <name>API Key</name>
+        <type>STRING</type>
+        <password>true</password>
+        <readonly>false</readonly>
+        <default></default>
+      </property>
+      <property>
+        <name>Snapshots</name>
+        <type>LIST</type>
+        <readonly>false</readonly>
+        <default>Off</default>
+        <items>
+          <item>Off</item>
+          <item>On</item>
+        </items>
+        <description>Applied to every camera on the next Create / Update or Push Settings.</description>
+      </property>
+      <property>
+        <name>Enable RTSP in Protect</name>
+        <type>LIST</type>
+        <readonly>false</readonly>
+        <default>Yes</default>
+        <items>
+          <item>Yes</item>
+          <item>No</item>
+        </items>
+        <description>RTSP is off by default in Protect for every camera. Yes lets each camera driver switch it on if it finds no stream enabled.</description>
+      </property>
+      <property>
+        <name>Cameras Found</name>
+        <type>STRING</type>
+        <readonly>true</readonly>
+        <default>0</default>
+      </property>
+      <property>
+        <name>Cameras Managed</name>
+        <type>STRING</type>
+        <readonly>true</readonly>
+        <default>0</default>
+      </property>
+      <property>
+        <name>Log Mode</name>
+        <type>LIST</type>
+        <readonly>false</readonly>
+        <default>Off</default>
+        <items>
+          <item>Off</item>
+          <item>Print</item>
+          <item>Log</item>
+          <item>Print and Log</item>
+        </items>
+      </property>
+      <property>
+        <name>Log Level</name>
+        <type>LIST</type>
+        <readonly>false</readonly>
+        <default>2 - Warning</default>
+        <items>
+          <item>1 - Error</item>
+          <item>2 - Warning</item>
+          <item>3 - Info</item>
+          <item>4 - Debug</item>
+        </items>
+      </property>
+    </properties>
+    <actions>
+      <action>
+        <name>Test Connection</name>
+        <command>TestConnection</command>
+      </action>
+      <action>
+        <name>Create / Update Cameras</name>
+        <command>SyncCameras</command>
+        <description>Adds a camera driver for every Protect camera that does not have one, and pushes settings to all of them. Safe to run repeatedly.</description>
+      </action>
+      <action>
+        <name>Push Settings to Cameras</name>
+        <command>PushSettings</command>
+        <description>Sends the current address, API key and snapshot setting to every managed camera. Use after rotating the API key.</description>
+      </action>
+      <action>
+        <name>Forget Managed Cameras</name>
+        <command>ForgetCameras</command>
+        <description>Clears this driver's list. Camera drivers are not removed; the next Create / Update adopts them again.</description>
+      </action>
+    </actions>
+    <script file="driver.lua"/>
+  </config>
+
+  <composer_categories>
+    <category>Camera</category>
+  </composer_categories>
+</devicedata>
