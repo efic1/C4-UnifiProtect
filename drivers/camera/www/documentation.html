@@ -1,1 +1,189 @@
+<html>
+<head>
+<style type="text/css">
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
+  font-size: 13px;
+  line-height: 1.55;
+  color: #24292e;
+  margin: 16px 20px;
+  max-width: 820px;
+}
+h1 {
+  font-size: 22px;
+  font-weight: 600;
+  border-bottom: solid #ddd 1px;
+  padding-bottom: 8px;
+  margin: 0 0 6px 0;
+}
+h2 {
+  font-size: 16px;
+  font-weight: 600;
+  margin-top: 26px;
+  margin-bottom: 8px;
+  border-bottom: solid #eee 1px;
+  padding-bottom: 4px;
+}
+h3 { font-size: 13.5px; font-weight: 600; margin: 18px 0 6px 0; }
+p  { margin: 6px 0 10px 0; }
+ul, ol { margin: 6px 0 12px 0; padding-left: 22px; }
+li { margin: 3px 0; }
+code {
+  font-family: "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+  background: #f3f4f6;
+  border: solid #e1e4e8 1px;
+  border-radius: 3px;
+  padding: 1px 4px;
+  font-size: 12px;
+}
+table { border-collapse: collapse; margin: 10px 0 14px 0; width: 100%; }
+th, td { border: solid #e1e4e8 1px; padding: 5px 9px; text-align: left; vertical-align: top; }
+th { background: #f6f8fa; font-weight: 600; }
+.note {
+  background: #f6f8fa;
+  border-left: solid #0366d6 3px;
+  padding: 8px 12px;
+  margin: 10px 0;
+}
+.warn {
+  background: #fffbdd;
+  border-left: solid #d9a300 3px;
+  padding: 8px 12px;
+  margin: 10px 0;
+}
+.sub { color: #6a737d; font-size: 12px; margin-top: 2px; }
+</style>
+</head>
+<body>
 
+<h1>UniFi Protect Camera</h1>
+<p class="sub">One driver instance per camera. No hub driver &mdash; each instance talks to the
+UniFi OS console on its own.</p>
+
+<div class="note">
+<b>Setting up several cameras?</b> Use the <b>UniFi Protect Setup</b> driver instead of
+configuring each camera by hand. Enter the address and API key once and it creates and
+configures a camera driver for every Protect camera.
+</div>
+
+<h2>Requirements</h2>
+<ul>
+  <li>UniFi OS console (UDM-Pro / UDM-SE / UNVR / CloudKey Gen2+) running Protect.</li>
+  <li>A UniFi API key with Protect access. No Protect username or password is needed.</li>
+  <li>Control4 OS 3.3.0 or later.</li>
+</ul>
+
+<h2>Setup</h2>
+<ol>
+  <li>Enter the <b>NVR Address</b> (the console's IP) and paste the <b>API Key</b>.</li>
+  <li>Run <b>Test Connection</b>. Driver Status should report the Protect version.</li>
+  <li>Run <b>Discover Cameras</b>, then choose the camera from the <b>Camera</b> dropdown.
+      The stream tokens are fetched automatically.</li>
+  <li>RTSP is off by default in Protect, per camera and per quality. With <b>Enable RTSP
+      Automatically</b> on (the default), the driver switches it on the first time it finds no
+      stream. Otherwise run <b>Enable RTSP Streams</b>.</li>
+</ol>
+
+<div class="note">
+<b>Ports are set automatically.</b> A new camera's proxy starts at 554, which is not Protect's
+port. The driver's <b>RTSP Port</b> property (default 7447) is the source of truth: the driver
+pushes it to the proxy at startup, again after a few seconds, and corrects the proxy whenever it
+reports a different value. To use a different port, change <b>RTSP Port</b> here rather than on
+the Camera Properties tab. If the proxy keeps reverting, Driver Status will say so.
+</div>
+
+<h2>How streaming works</h2>
+<p>The driver supplies the stream token; the camera proxy builds
+<code>rtsp://&lt;console&gt;:7447/&lt;token&gt;</code>. Plain RTSP on 7447 is used rather than
+RTSPS on 7441 because 7441 is SRTP behind a self-signed certificate that Control4 will not
+validate, while 7447 needs no certificate and no credentials &mdash; the token is the secret.</p>
+<p>The driver declares <code>http_tunnel</code>, which keeps Director in the media path so
+streams reach remote clients through 4Sight without port forwarding.</p>
+<p><b>Preferred Quality</b> applies when a client does not state a size. Otherwise the driver
+picks from the requested width: up to 640 gets Low, up to 1280 gets Medium, above that High.
+Only qualities enabled in Protect are offered.</p>
+
+<h2>Snapshots</h2>
+<p>Protect refuses credentials passed in a URL, and Navigator can only fetch URLs &mdash; it
+cannot send headers. So the driver fetches the frame from Protect itself, with the API key as a
+header, caches it, and serves it from a small HTTP listener on the controller. Navigator fetches
+a plain LAN URL and the API key never leaves the controller. <b>No Protect username or password
+is required.</b></p>
+<p>Set <b>Snapshots</b> to <i>On</i>. <b>Snapshot Status</b> shows the listening port and whether
+frames are arriving. <b>Controller Address</b> can stay blank unless auto-detection fails.</p>
+<ul>
+  <li>The listener takes an OS-assigned port, so it cannot collide with Director or another driver.</li>
+  <li>Frames under 5 seconds old are served from cache; one camera makes at most one request to
+      Protect per 5 seconds no matter how many Navigators are watching.</li>
+  <li>The cached frame is released after two minutes with no requests, so idle cameras hold no memory.</li>
+  <li>Frames are requested at standard quality. Protect re-encodes on every request and a
+      frame from a 4K camera can still be around 1&nbsp;MB, so raise the Snapshot Refresh Rate on
+      the Camera Properties tab if several cameras are on screen at once.</li>
+  <li>The snapshot URL is unauthenticated and reachable by anything on your LAN. The API key is not.</li>
+  <li>Thumbnails may not load away from home, since the URL is a LAN address. Live video is
+      unaffected and works remotely through 4Sight.</li>
+</ul>
+
+<h2>Events</h2>
+<p>Detection events are polled, because DriverWorks has no WebSocket client. <b>Event Polling
+Interval</b> is <b>Off</b> by default &mdash; no periodic API calls are made until you choose an
+interval.</p>
+<table>
+  <tr><th>Interval</th><th>Requests per hour, per camera</th></tr>
+  <tr><td>1 second</td><td>3,600</td></tr>
+  <tr><td>5 seconds</td><td>720</td></tr>
+  <tr><td>15 seconds</td><td>240</td></tr>
+  <tr><td>60 seconds</td><td>60</td></tr>
+</table>
+<p>With <b>Adaptive Polling</b> on, any event triggers a burst of one-per-second polling for
+<b>Adaptive Burst</b> seconds before dropping back. A slow baseline then still tracks activity
+closely. <b>API Call Rate</b> shows the current figure.</p>
+<p>Detection state clears when Protect reports the event ending; <b>Event Hold Time</b> is a
+watchdog for when no end arrives.</p>
+
+<h3>Programming events</h3>
+<p>Motion Detected, Motion Ended, Person Detected, Vehicle Detected, Animal Detected,
+Package Detected, Doorbell Pressed, Camera Online, Camera Offline.</p>
+<p>Matching boolean variables: <code>MOTION_DETECTED</code>, <code>PERSON_DETECTED</code>,
+<code>VEHICLE_DETECTED</code>, <code>ANIMAL_DETECTED</code>, <code>PACKAGE_DETECTED</code>,
+<code>DOORBELL_RING</code>.</p>
+
+<h2>Actions</h2>
+<table>
+  <tr><th>Action</th><th>What it does</th></tr>
+  <tr><td>Test Connection</td><td>Verifies the address and key, reports the Protect version.</td></tr>
+  <tr><td>Discover Cameras</td><td>Lists cameras and fills the Camera dropdown.</td></tr>
+  <tr><td>Fetch Stream Aliases</td><td>Re-reads the stream tokens for this camera.</td></tr>
+  <tr><td>Enable RTSP Streams</td><td>Asks Protect to turn RTSP on for all three qualities.</td></tr>
+  <tr><td>Run Diagnostics</td><td>Tests snapshot auth both ways, checks tokens are current, reports port problems.</td></tr>
+  <tr><td>Show Stream URLs</td><td>Prints what the driver hands the proxy.</td></tr>
+  <tr><td>Simulate Motion / Person / Doorbell</td><td>Fires an event for testing programming.</td></tr>
+</table>
+
+<h2>Troubleshooting</h2>
+<table>
+  <tr><th>Symptom</th><th>Cause and fix</th></tr>
+  <tr><td>No video, Camera Test fails</td><td>Check the RTSP port on the Camera Properties tab is 7447, not 554. Reload the driver to have it set automatically.</td></tr>
+  <tr><td>"RTSP is off for this camera"</td><td>Protect has no stream enabled and auto-enable is off, or Protect refused to enable it. Run Enable RTSP Streams.</td></tr>
+  <tr><td>"Protect is busy - retrying"</td><td>The console asked for fewer requests (HTTP 429). The driver backs off and retries automatically; no action needed.</td></tr>
+  <tr><td>"Protect was too busy"</td><td>Retries ran out. Wait a minute and run Fetch Stream Aliases.</td></tr>
+  <tr><td>"Fetching streams..." never clears</td><td>The console is not answering. Run Test Connection.</td></tr>
+  <tr><td>Only one quality offered</td><td>Only one channel has RTSP enabled. Run Enable RTSP Streams, then Fetch Stream Aliases.</td></tr>
+  <tr><td>Auth Failed</td><td>Bad or revoked API key. Run Test Connection after correcting it.</td></tr>
+  <tr><td>Events never fire</td><td>Event Polling Interval is Off by default.</td></tr>
+</table>
+<p>For anything else, set <b>Log Mode</b> to <i>Print</i> and <b>Log Level</b> to <i>4 - Debug</i>,
+then reproduce the problem and read the Lua tab. Debug logging disables itself after 8 hours.</p>
+
+<h2>Limitations</h2>
+<ul>
+  <li><b>No audio.</b> Protect sends AAC; Control4 accepts G.711 &micro;-law only.</li>
+  <li><b>No PTZ</b>, no presets, no two-way talk, no recorded playback.</li>
+  <li>Detection latency matches the polling interval.</li>
+  <li>Smart detections fire only when Protect names a detection class. If detections arrive with
+      no class list the driver logs a warning rather than guessing, since guessing would fire
+      false person events.</li>
+</ul>
+
+</body>
+</html>
