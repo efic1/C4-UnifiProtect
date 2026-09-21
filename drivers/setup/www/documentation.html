@@ -1,1 +1,133 @@
+<html>
+<head>
+<style type="text/css">
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
+  font-size: 13px;
+  line-height: 1.55;
+  color: #24292e;
+  margin: 16px 20px;
+  max-width: 820px;
+}
+h1 {
+  font-size: 22px;
+  font-weight: 600;
+  border-bottom: solid #ddd 1px;
+  padding-bottom: 8px;
+  margin: 0 0 6px 0;
+}
+h2 {
+  font-size: 16px;
+  font-weight: 600;
+  margin-top: 26px;
+  margin-bottom: 8px;
+  border-bottom: solid #eee 1px;
+  padding-bottom: 4px;
+}
+h3 { font-size: 13.5px; font-weight: 600; margin: 18px 0 6px 0; }
+p  { margin: 6px 0 10px 0; }
+ul, ol { margin: 6px 0 12px 0; padding-left: 22px; }
+li { margin: 3px 0; }
+code {
+  font-family: "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+  background: #f3f4f6;
+  border: solid #e1e4e8 1px;
+  border-radius: 3px;
+  padding: 1px 4px;
+  font-size: 12px;
+}
+table { border-collapse: collapse; margin: 10px 0 14px 0; width: 100%; }
+th, td { border: solid #e1e4e8 1px; padding: 5px 9px; text-align: left; vertical-align: top; }
+th { background: #f6f8fa; font-weight: 600; }
+.note {
+  background: #f6f8fa;
+  border-left: solid #0366d6 3px;
+  padding: 8px 12px;
+  margin: 10px 0;
+}
+.warn {
+  background: #fffbdd;
+  border-left: solid #d9a300 3px;
+  padding: 8px 12px;
+  margin: 10px 0;
+}
+.sub { color: #6a737d; font-size: 12px; margin-top: 2px; }
+</style>
+</head>
+<body>
 
+<h1>UniFi Protect Setup</h1>
+<p class="sub">Creates and configures one UniFi Protect Camera driver per camera, so the console
+address and API key are entered once.</p>
+
+<h2>Before you start</h2>
+<div class="note">
+Load <b>unifi_protect_camera.c4z</b> into Composer first. This driver creates camera drivers
+with <code>C4:AddDevice</code>, which can only instantiate a driver already in Composer's driver
+database. You do not need to add a camera driver to the project yourself.
+</div>
+
+<h2>Setup</h2>
+<ol>
+  <li>Add this driver to the room where you want the cameras to appear.</li>
+  <li>Enter <b>NVR Address</b> and <b>API Key</b>, then run <b>Test Connection</b>.</li>
+  <li>Choose <b>Snapshots</b> On or Off.</li>
+  <li>Leave <b>Enable RTSP in Protect</b> on Yes unless you want to manage RTSP yourself.
+      RTSP is off by default in Protect; with Yes, each camera switches it on if needed.</li>
+  <li>Run <b>Create / Update Cameras</b>.</li>
+</ol>
+<p>One camera driver appears per Protect camera, named after it, already configured with the
+address, key, camera, stream tokens and snapshot setting. Move them to other rooms as you like.</p>
+
+<h2>What it does and does not do</h2>
+<p>This driver is only involved in setup. It is <b>not</b> in the video path or the event path,
+and each camera driver runs independently once configured. Removing this driver leaves every
+camera working.</p>
+
+<h2>Actions</h2>
+<table>
+  <tr><th>Action</th><th>What it does</th></tr>
+  <tr><td>Test Connection</td><td>Checks the address and key, reports the Protect version.</td></tr>
+  <tr><td>Create / Update Cameras</td><td>Adds a driver for every camera without one and pushes settings to all. Safe to run any number of times.</td></tr>
+  <tr><td>Push Settings to Cameras</td><td>Sends the current address, key and snapshot setting to every managed camera. Use after rotating the API key.</td></tr>
+  <tr><td>Forget Managed Cameras</td><td>Clears this driver's list without touching any camera driver. The next Create / Update adopts them again.</td></tr>
+</table>
+
+<h2>Pacing</h2>
+<p>Cameras are configured one at a time, a couple of seconds apart, rather than all at once.
+Configuring every camera in the same instant made the console refuse requests (HTTP 429). With
+eight cameras, Create / Update or Push Settings takes about twenty seconds; <b>Setup Status</b>
+shows progress.</p>
+
+<h2>Re-running is safe</h2>
+<ul>
+  <li>Cameras that already have a driver are updated, never duplicated.</li>
+  <li>Camera drivers added by hand, or left from an earlier install, are found and adopted rather
+      than recreated. The driver waits a few seconds for them to identify themselves first.</li>
+  <li>A camera added in Protect later gets a driver on the next run.</li>
+  <li>Nothing is ever deleted. A camera removed from Protect keeps its driver until you remove it.</li>
+</ul>
+
+<h2>Snapshots</h2>
+<p>Each camera driver runs its own small snapshot server on an OS-assigned port, so eight cameras
+means eight independent listeners that cannot collide. Pushing new settings reuses each camera's
+existing listener, so the snapshot URL Navigators hold stays valid.</p>
+
+<h2>Rotating the API key</h2>
+<ol>
+  <li>Create the new key in UniFi OS.</li>
+  <li>Paste it into <b>API Key</b> here.</li>
+  <li>Run <b>Push Settings to Cameras</b>.</li>
+</ol>
+
+<h2>Troubleshooting</h2>
+<table>
+  <tr><th>Symptom</th><th>Cause and fix</th></tr>
+  <tr><td>"Could not add a driver"</td><td>unifi_protect_camera.c4z is not loaded in Composer.</td></tr>
+  <tr><td>Auth Failed</td><td>Bad or revoked API key.</td></tr>
+  <tr><td>A camera was duplicated</td><td>Its driver had no camera configured when it was asked to identify. Remove the duplicate.</td></tr>
+  <tr><td>A camera has no video</td><td>RTSP is off for it in Protect. Run Enable RTSP Streams on that camera driver.</td></tr>
+</table>
+
+</body>
+</html>
