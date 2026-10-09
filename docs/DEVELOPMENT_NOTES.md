@@ -117,6 +117,17 @@ port". The proxy sends `SET_RTSP_PORT`. Handle both.
   outliving the success that should have replaced it. There is now exactly one writer, and a test
   that enforces it.
 
+- **A chain of one-shot timers is only as reliable as its weakest callback.** The poll schedules
+  its next tick from inside the reply handler, so an exception in that handler, or a reply that
+  never arrives, ends polling with no error. Wrap the handler in `pcall` and arm a watchdog.
+- **Every in-flight request needs to know which camera it was for.** Replies arrive in any order.
+  Capture a generation counter when the request goes out and drop the reply if it has changed.
+- **A "baseline" must be recorded even when the value is zero or absent.** Otherwise the first
+  real event is mistaken for the baseline and silently dropped.
+- **Do not let everything start at once.** Eight drivers loading together issue sixteen requests in
+  the same instant. Spread startup work with a per-device random delay, and seed the generator
+  (`math.randomseed`) per device or every driver draws the same "random" numbers.
+
 ---
 
 ## UniFi Protect (integration API, 6.x)

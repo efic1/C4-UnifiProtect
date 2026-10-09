@@ -210,7 +210,8 @@ test("the rest follow at spaced intervals", function()
     local st = setup()
     ExecuteCommand("LUA_ACTION", { ACTION = "SyncCameras" })
     local delays = {}
-    for _, tm in ipairs(st.timers) do table.insert(delays, tm.ms) end
+    -- (the 30 s safety timer that releases a stuck sync is not pacing)
+    for _, tm in ipairs(st.timers) do if tm.ms < 20000 then table.insert(delays, tm.ms) end end
     table.sort(delays)
     eq(#delays, 2, "two cameras deferred")
     truthy(delays[1] >= 2000, "first deferral at least 2s, got " .. delays[1])
@@ -277,6 +278,72 @@ test("a failed AddDevice does not record a camera", function()
     drain(st)
     eq(st.persist["managed_cameras"] and next(st.persist["managed_cameras"]) or nil, nil,
        "nothing recorded as managed")
+end)
+
+print("\nRecovering and finishing")
+
+-- A driver deleted in Composer left its device ID in the managed map, so the
+-- camera was "updated" (a message to nothing) and never recreated.
+test("a camera driver deleted in Composer is recreated", function()
+    local st = setup()
+    ExecuteCommand("LUA_ACTION", { ACTION = "SyncCameras" })
+    drain(st)
+    local ids = {}
+    for _, a in ipairs(st.added) do ids[#ids + 1] = a.id end
+    eq(#ids, 3, "drivers after the first sync")
+    -- Composer now holds only the first two; the third was deleted.
+    st.existingDevices[tostring(ids[1])] = ids[1]
+    st.existingDevices[tostring(ids[2])] = ids[2]
+    ExecuteCommand("LUA_ACTION", { ACTION = "SyncCameras" })
+    drain(st)
+    eq(#st.added, 4, "the deleted camera's driver was added again")
+    eq(st.added[4].name, "Camera C3", "which camera was recreated")
+end)
+
+-- An empty lookup cannot tell "everything deleted" from "lookup failed", and
+-- pruning on it would duplicate every camera.
+test("an empty device lookup does not make setup recreate every camera", function()
+    local st = setup()
+    ExecuteCommand("LUA_ACTION", { ACTION = "SyncCameras" })
+    drain(st)
+    local before = #st.added
+    st.existingDevices = {}
+    ExecuteCommand("LUA_ACTION", { ACTION = "SyncCameras" })
+    drain(st)
+    eq(#st.added, before, "no duplicates")
+end)
+
+-- "Done" used to be reported when the last job STARTED. AddDevice answers
+-- later, so a second press in that gap could add the same camera twice.
+test("Done waits for the last driver to be created", function()
+    local st = setup()
+    local pendingCb
+    st.C4.AddDevice = function(self, file, room, name, cb)
+        st.nextDeviceId = st.nextDeviceId + 1
+        local id = st.nextDeviceId
+        table.insert(st.added, { file = file, room = room, name = name, id = id })
+        if name == "Camera C3" then pendingCb = function() cb(id) end else cb(id) end
+    end
+    ExecuteCommand("LUA_ACTION", { ACTION = "SyncCameras" })
+    for _ = 1, 10 do st.fireTimers(function(tm) return tm.ms < 20000 end) end   -- pacing only
+    truthy(pendingCb, "the last camera's AddDevice is still outstanding")
+    truthy(not st.props["Setup Status"]:find("Done", 1, true), "not Done while a driver is being created")
+    ExecuteCommand("LUA_ACTION", { ACTION = "SyncCameras" })
+    eq(#st.added, 3, "a second press does not start another sync")
+    pendingCb()
+    contains(st.props["Setup Status"], "Done", "Done once it has been created")
+end)
+
+test("a sync is released even if a driver never reports back", function()
+    local st = setup()
+    st.C4.AddDevice = function(self, file, room, name, cb)
+        st.nextDeviceId = st.nextDeviceId + 1
+        table.insert(st.added, { file = file, room = room, name = name, id = st.nextDeviceId })
+        -- never calls cb
+    end
+    ExecuteCommand("LUA_ACTION", { ACTION = "SyncCameras" })
+    drain(st)
+    contains(st.props["Setup Status"], "Done", "released by the safety timer")
 end)
 
 --=============================================================================
