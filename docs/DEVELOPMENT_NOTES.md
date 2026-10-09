@@ -232,5 +232,15 @@ JSON text frames:
   that the setup happened (for example, that the requests were made) as well as the outcome.
 - **Performance regressions need timing tests.** Correct-but-quadratic parsing passes every
   correctness test. Measure both versions first and set a threshold with a wide margin.
+- **Test the "late reply" cases.** Anything asynchronous needs a test where the answer arrives
+  after the world has moved on (camera switched, key changed, never arrives at all). The async stub
+  with `reverseFlush` (deliver the newest reply first) and `{ hang = true }` / `{ err = true }`
+  routes make these cheap to write.
+- **A shared random generator hides a seeding bug.** Eight cameras created in one test process
+  drew different "random" slots because the generator kept running between them. Assert on
+  `math.randomseed` itself, with distinct device ids, instead of on the spread of values.
+- **Mutation-check every fix, including the status ones.** Three tests here first passed with their
+  fix removed because another code path happened to repair the same state (a follow-up connection
+  test, a follow-up alias fetch). Make the other path fail or hang so only the fix can pass.
 - **Read a working implementation early.** Most of the time lost on this project went to reasoning
   from thin documentation when a working open-source driver already had the answer.

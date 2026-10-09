@@ -15,7 +15,7 @@
          none, and push configuration to all of them
 --]]
 
-local DRIVER_VERSION = "4"
+local DRIVER_VERSION = "5"
 local CAMERA_DRIVER   = "unifi_protect_camera.c4z"
 local PERSIST_MANAGED = "managed_cameras"     -- camera_id -> device_id
 local ADOPT_WAIT_MS   = 3000
@@ -257,19 +257,49 @@ end
 --=============================================================================
 -- Staggering
 --=============================================================================
+-- Each job receives a finish() callback and calls it when its work is really
+-- over (adding a device is asynchronous: the job has "run" long before the
+-- device exists). onDone fires once, when every job has finished. A job that
+-- never reports back cannot wedge the sync: after SAFETY_MS onDone fires
+-- anyway.
+local SAFETY_MS = 30000
+
 local function runStaggered(jobs, onDone)
     if #jobs == 0 then
         if onDone then onDone() end
         return
     end
+    local remaining, done, safety = #jobs, false, nil
+    local function complete()
+        if done then return end
+        done = true
+        if safety then safety:Cancel(); safety = nil end
+        if onDone then onDone() end
+    end
     for i, job in ipairs(jobs) do
-        local last = (i == #jobs)
+        local finished = false
+        local function finish()
+            if finished then return end
+            finished = true
+            remaining = remaining - 1
+            if remaining <= 0 then complete() end
+        end
         local run = function()
-            job()
-            if last and onDone then onDone() end
+            local ok, err = pcall(job, finish)
+            if not ok then
+                log(LVL.ERROR, "Sync step failed: %s", tostring(err))
+                finish()
+            end
         end
         if i == 1 then run() else C4:SetTimer((i - 1) * STAGGER_MS, run) end
     end
+    safety = C4:SetTimer(#jobs * STAGGER_MS + SAFETY_MS, function()
+        safety = nil
+        if not done then
+            log(LVL.WARN, "Sync did not finish in time; releasing it")
+            complete()
+        end
+    end)
 end
 
 --=============================================================================
@@ -284,14 +314,15 @@ local function finishSync()
         local devId = managed[cam.id]
         if devId then
             updated = updated + 1
-            table.insert(jobs, function() pushConfig(devId, cam) end)
+            table.insert(jobs, function(finish) pushConfig(devId, cam); finish() end)
         else
             added = added + 1
-            table.insert(jobs, function()
+            table.insert(jobs, function(finish)
                 C4:AddDevice(CAMERA_DRIVER, room, displayName(cam), function(newId)
                     if not newId or newId == 0 then
                         log(LVL.ERROR, "Could not add a driver for %s. Is %s loaded in Composer?",
                             displayName(cam), CAMERA_DRIVER)
+                        finish()
                         return
                     end
                     local m = getManaged()
@@ -299,6 +330,7 @@ local function finishSync()
                     saveManaged(m)
                     pushConfig(newId, cam)
                     log(LVL.INFO, "Added %s (device %d)", displayName(cam), newId)
+                    finish()
                 end)
             end)
         end
@@ -346,10 +378,32 @@ local function syncCameras()
         -- behind by an earlier install) before creating anything, so a
         -- re-run never duplicates.
         local managed = getManaged()
+        local existing = C4:GetDevicesByC4iName(CAMERA_DRIVER)
+
+        -- A camera driver deleted in Composer leaves its id behind in the
+        -- managed list; the sync would then keep configuring a device that no
+        -- longer exists and never add a replacement. Prune ids that are gone,
+        -- but only when the lookup actually returned something: an empty
+        -- answer is more likely a failed lookup than "all eight are gone".
+        if type(existing) == "table" and next(existing) ~= nil then
+            local present = {}
+            for rawId in pairs(existing) do present[tonumber(rawId)] = true end
+            local pruned = 0
+            for camId, devId in pairs(managed) do
+                if not present[tonumber(devId)] then
+                    managed[camId] = nil
+                    pruned = pruned + 1
+                end
+            end
+            if pruned > 0 then
+                saveManaged(managed)
+                log(LVL.INFO, "Dropped %d managed camera(s) whose driver no longer exists", pruned)
+            end
+        end
+
         local known = {}
         for _, id in pairs(managed) do known[tonumber(id)] = true end
         local asked = 0
-        local existing = C4:GetDevicesByC4iName(CAMERA_DRIVER)
         if type(existing) == "table" then
             for rawId in pairs(existing) do
                 local devId = tonumber(rawId)
@@ -381,7 +435,7 @@ local function pushSettings()
     local jobs = {}
     for camId, devId in pairs(managed) do
         local cam = byId[camId] or { id = camId }
-        table.insert(jobs, function() pushConfig(devId, cam) end)
+        table.insert(jobs, function(finish) pushConfig(devId, cam); finish() end)
     end
     local n = #jobs
     status(string.format("Pushing settings to %d camera%s...", n, n == 1 and "" or "s"))

@@ -5,8 +5,8 @@
   <name>UniFi Protect Setup</name>
   <model>UniFi Protect Setup</model>
   <created>09/20/2026</created>
-  <modified>09/20/2026</modified>
-  <version>4</version>
+  <modified>10/09/2026</modified>
+  <version>5</version>
   <small>devices_sm/camera.gif</small>
   <large>devices_lg/camera.gif</large>
   <control>lua_gen</control>
