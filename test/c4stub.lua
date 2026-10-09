@@ -36,6 +36,21 @@ function M.new(opts)
         -- race where status was computed before the HTTP reply arrived.
         async      = opts.async or false,
         pending    = {},
+        -- network connections (the event WebSocket)
+        net        = { created = {}, options = {}, connects = 0, disconnects = 0 },
+        netSent    = {},    -- raw bytes the driver wrote, in order
+        history    = {},    -- each RecordHistory call's arguments
+        registered = {},    -- each RegisterEvents XML
+        registerResult = (opts.registerResult == nil) and true or opts.registerResult,
+        -- C4:GetProxyDevices() returns a NUMBER (documented, and field-verified:
+        -- a table here hid a bug that left the proxy unnamed and History
+        -- unregistered). proxyReturn lets a test try other shapes.
+        proxyId    = opts.proxyId or 901,
+        proxyReturn = opts.proxyReturn,
+        -- Real names from the field: the proxy is named after <proxy name=...>,
+        -- the driver device after <name>. History labels records with the latter.
+        displayNames = opts.displayNames or { [901] = "UniFi Protect Camera",
+                                              [100] = "UniFi Protect Camera (Standalone)" },
         routes     = opts.routes or {},
         directorVersion = opts.directorVersion or "3.4.3.1",
     }
@@ -71,6 +86,30 @@ function M.new(opts)
         return true
     end
     function C4:DestroyServer(port) table.insert(st.destroyed, port) end
+    function C4:CreateNetworkConnection(binding, addr, ctype)
+        table.insert(st.net.created, { binding = binding, address = addr, type = ctype })
+    end
+    function C4:NetPortOptions(binding, port, ctype, opts)
+        table.insert(st.net.options, { binding = binding, port = port, type = ctype, opts = opts })
+    end
+    function C4:NetConnect(binding, port) st.net.connects = st.net.connects + 1 end
+    function C4:NetDisconnect(binding, port) st.net.disconnects = st.net.disconnects + 1 end
+    function C4:SendToNetwork(binding, port, data)
+        table.insert(st.netSent, { binding = binding, port = port, data = data })
+    end
+    function C4:GetProxyDevices()
+        if st.proxyReturn ~= nil then return st.proxyReturn end
+        return st.proxyId
+    end
+    function C4:RegisterEvents(xml)
+        table.insert(st.registered, xml)
+        return st.registerResult
+    end
+    function C4:RecordHistory(...)
+        local args = { n = select("#", ...), ... }
+        table.insert(st.history, args)
+        return "uuid-" .. #st.history
+    end
     function C4:GetDeviceID() return st.deviceId end
     function C4:RoomGetId() return st.roomId end
     function C4:SendToDevice(dev, cmd, params)
@@ -83,7 +122,11 @@ function M.new(opts)
         if cb then cb(id, { [tostring(id + 1000)] = id + 1000 }) end
         return id
     end
-    function C4:RenameDevice(id, name) table.insert(st.renamed, { id = id, name = name }) end
+    function C4:RenameDevice(id, name)
+        table.insert(st.renamed, { id = id, name = name })
+        st.displayNames[id] = name
+    end
+    function C4:GetDeviceDisplayName(id) return st.displayNames[id or st.deviceId] end
     function C4:GetDevicesByC4iName(name) return st.existingDevices end
     function C4:PersistSetValue(k, v) st.persist[k] = v end
     function C4:PersistGetValue(k) return st.persist[k] end

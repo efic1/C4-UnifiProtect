@@ -13,7 +13,7 @@
 --]]
 
 -- Must equal <version> in driver.xml; the build refuses to package otherwise.
-local DRIVER_VERSION = "47"
+local DRIVER_VERSION = "52"
 local CAMERA_BINDING = 5001
 
 --=============================================================================
@@ -28,21 +28,36 @@ local g = {
     initializing   = false,  -- true while LateInit replays stored properties
     pollInterval   = 0,
     holdTime       = 5,
-    detect         = { person = true, vehicle = true, animal = false, package = false },
+    detect         = { person = true, vehicle = true, animal = false, package = false,
+                       motion = true, doorbell = true },
+    -- What goes to the Control4 History timeline. Separate from detect: a
+    -- vehicle can drive lighting without cluttering the timeline.
+    history        = { person = true, vehicle = false, animal = false, package = true,
+                       motion = false, doorbell = true },
+    historyCooldown = 60,     -- seconds between records of the same type
+    historyLast    = {},
+    historyRegistered = false,
+    historyRegisteredName = nil,
+    wsOpen         = false,   -- mirrors the event socket, readable before it is defined
+    stats          = { apiRequests = 0, wsMessages = 0, wsDecoded = 0, wsIgnored = 0,
+                       historyRecorded = 0, historySkipped = 0, historyFailed = 0 },
     logMode        = "Off",
     logLevel       = 2,
-    online         = nil,     -- camera connection state; nil until the first valid poll
+    online         = false,   -- camera connection state, from polling
     pollTimer      = nil,
     pollBusy       = false,
     adaptive       = true,
     burstSeconds   = 30,
     fastUntil      = 0,
     debugTimer     = nil,
-    holdTimers     = {},    -- one per event type; a shared timer would clobber state
+    holdTimers     = {},     -- one per event type; a shared timer would clobber state
+    active         = {},
+    eventSource    = "WebSocket (instant)",     -- kind -> true while a detection is in progress
     lastSeen       = {},    -- event type -> last timestamp seen from Protect
     streamKey      = 0,
     rtspPort       = 7447,
     parentId       = nil,
+    cameraName     = "",
     portCorrections = 0,
     portWarned     = false,
     aliasState     = "idle",   -- idle | pending | enabling | none | limited | ok
@@ -67,14 +82,6 @@ local g = {
     reaperTimer    = nil,
     httpPort       = 443,
     cameraMap      = {},   -- display name -> Protect camera id
-    gen            = 0,    -- bumps whenever the camera changes; replies for an older value are dropped
-    pollSeq        = 0,    -- identifies the poll whose reply is still wanted
-    pollStartedAt  = nil,
-    pollWatch      = nil,  -- timer that abandons a poll whose reply never arrives
-    active         = {},   -- event kind -> true while its variable is set
-    failStreak     = 0,    -- consecutive transport failures
-    serverPending  = false, -- CreateServer called, ONLINE not yet reported
-    snapWaiters    = {},   -- callbacks waiting on the snapshot fetch in flight
 }
 
 local QUALITY_ORDER = { "Low", "Medium", "High" }
@@ -260,6 +267,7 @@ end
 
 local function request(method, path, body, cb, quiet, attempt)
     attempt = attempt or 1
+    g.stats.apiRequests = g.stats.apiRequests + 1
     if g.address == "" then
         if cb then cb(false, nil, 0, "no address") end
         return
@@ -281,20 +289,10 @@ local function request(method, path, body, cb, quiet, attempt)
             if errCode ~= 0 and code == 0 then
                 log(LVL.ERROR, "Transport error on %s: [%s] %s",
                     path, tostring(errCode), tostring(errMsg))
-                -- The event poll runs continuously: one timeout is not
-                -- "unreachable". Require a short streak from quiet callers.
-                g.failStreak = (g.failStreak or 0) + 1
-                if not quiet or g.failStreak >= 3 then g.unreachable = true end
+                g.unreachable = true
                 computeStatus()
                 if cb then cb(false, nil, 0, errMsg) end
                 return
-            end
-
-            -- Any HTTP answer proves the console is reachable again.
-            g.failStreak = 0
-            if g.unreachable then
-                g.unreachable = false
-                computeStatus()
             end
 
             if code == 429 then
@@ -355,13 +353,6 @@ local function request(method, path, body, cb, quiet, attempt)
                 log(LVL.DEBUG, "Body: %s", tostring(raw):sub(1, 300))
                 if cb then cb(false, nil, code, raw) end
                 return
-            end
-
-            -- A 2xx proves the key is valid and the API is present, whatever
-            -- an earlier failure said.
-            if g.authFailed or g.connError then
-                g.authFailed, g.connError = false, nil
-                computeStatus()
             end
 
             log(LVL.TRACE, "HTTP %d body: %s", code, tostring(raw):sub(1, 500))
@@ -759,7 +750,6 @@ end
 local SNAP_FRESH_SEC  = 5          -- serve from cache below this age
 local SNAP_IDLE_SEC   = 120        -- release the cached frame after this quiet
 local MAX_SNAP_BYTES  = 4 * 1024 * 1024
-local SNAP_MAX_STALE_SEC = 60      -- never serve a frame older than this, even if fetches fail
 
 local function snapshotReady()
     return g.snapshots and g.serverPort and g.controllerIp and g.controllerIp ~= ""
@@ -770,36 +760,23 @@ local function snapshotUrl()
     return string.format("http://%s:%d/snapshot.jpg", g.controllerIp, g.serverPort)
 end
 
--- Releases everyone waiting on the fetch in flight. Requests that arrive
--- while a fetch is running wait for it; they used to be turned away with a
--- 503 when the cache was empty.
-local function flushSnapWaiters(ok)
-    local waiters = g.snapWaiters
-    g.snapWaiters = {}
-    for _, f in ipairs(waiters) do pcall(f, ok) end
-end
-
 local function refreshSnapshot(cb)
     if g.cameraId == "" or g.address == "" or g.apiKey == "" then
         if cb then cb(false) end
         return
     end
-    if cb then g.snapWaiters[#g.snapWaiters + 1] = cb end
-    if g.snapFetching then return end
+    if g.snapFetching then if cb then cb(false) end return end
     g.snapFetching = true
-    local gen = g.gen
 
     -- Only highQuality is supported here. Adding w= returns HTTP 400.
     local path = string.format("/proxy/protect/integration/v1/cameras/%s/snapshot?highQuality=false",
         g.cameraId)
     local fullUrl = "https://" .. g.address .. path
+    g.stats.apiRequests = g.stats.apiRequests + 1
     -- Safe to log in full: the API key travels as a header, not in the URL.
     log(LVL.INFO, "Snapshot fetch: %s", fullUrl)
     C4:url()
         :OnDone(function(transfer, responses, errCode, errMsg)
-            -- The camera changed while this was in flight. setCameraId already
-            -- released the waiters; this frame belongs to the old camera.
-            if gen ~= g.gen then return end
             g.snapFetching = false
             local resp = responses and responses[#responses]
             local code = resp and resp.code or 0
@@ -811,7 +788,7 @@ local function refreshSnapshot(cb)
                     C4:UpdateProperty("Snapshot Status", "Active on port " .. tostring(g.serverPort))
                     log(LVL.INFO, "Snapshot OK: %d bytes from %s", #body, fullUrl)
                 end
-                flushSnapWaiters(true)
+                if cb then cb(true) end
             else
                 if g.snapState ~= "fail" then
                     g.snapState = "fail"
@@ -827,7 +804,7 @@ local function refreshSnapshot(cb)
                     end
                     log(LVL.WARN, "  camera id: %s", g.cameraId)
                 end
-                flushSnapWaiters(false)
+                if cb then cb(false) end
             end
         end)
         :SetOption("ssl_verify_peer", false)
@@ -846,14 +823,8 @@ local function httpReply(handle, status, ctype, body)
 end
 
 function OnServerStatusChanged(port, status, identifier)
-    g.serverPending = false
     if status ~= "ONLINE" then
         g.serverPort = nil
-        return
-    end
-    if not g.snapshots then
-        -- Switched off while the listener was still starting.
-        C4:DestroyServer(port)
         return
     end
     g.serverPort = port
@@ -891,13 +862,9 @@ function OnServerDataIn(handle, data, address, port, identifier)
         httpReply(handle, "200 OK", "image/jpeg", g.snapData)
         return
     end
-    refreshSnapshot(function(ok)
-        -- A recent frame beats a blank tile, but not one that has been
-        -- failing to refresh for a minute: that would hide an outage.
-        local usable = ok or (g.snapData and g.snapTime
-            and (os.time() - g.snapTime) <= SNAP_MAX_STALE_SEC)
-        if usable and g.snapData then
-            httpReply(handle, "200 OK", "image/jpeg", g.snapData)
+    refreshSnapshot(function()
+        if g.snapData then
+            httpReply(handle, "200 OK", "image/jpeg", g.snapData)   -- stale beats blank
         else
             httpReply(handle, "503 Service Unavailable", "text/plain", "no snapshot")
         end
@@ -909,7 +876,7 @@ local function ensureSnapshotServer()
         if g.serverPort then startSnapshotServer() end   -- tears it down
         return
     end
-    if g.serverPort or g.serverPending then
+    if g.serverPort then
         -- Same listener, same port: just discard the frame from the old camera.
         -- The next request fetches from the new one.
         g.snapData, g.snapTime, g.snapState = nil, nil, nil
@@ -919,10 +886,6 @@ local function ensureSnapshotServer()
 end
 
 function startSnapshotServer()
-    -- A listener is already starting and will report its port. Creating a
-    -- second one here would orphan the first: its port is not known yet, so
-    -- it could never be destroyed.
-    if g.snapshots and g.serverPending then return end
     if g.serverPort then C4:DestroyServer(g.serverPort); g.serverPort = nil end
     if g.reaperTimer then g.reaperTimer:Cancel(); g.reaperTimer = nil end
     g.snapData, g.snapTime, g.snapState = nil, nil, nil
@@ -939,7 +902,6 @@ function startSnapshotServer()
         C4:UpdateProperty("Snapshot Status", "Listener failed")
         return
     end
-    g.serverPending = true
     -- Release the cached frame for a camera nobody is looking at.
     g.reaperTimer = C4:SetTimer(60000, function()
         if g.snapData and g.lastServe and (os.time() - g.lastServe) > SNAP_IDLE_SEC then
@@ -997,104 +959,635 @@ end
 --=============================================================================
 -- Events
 --=============================================================================
+-- The proxy device's id. C4:GetProxyDevices() returns a NUMBER - the
+-- documented example prints "proxy is: 393". Treating it as a table (as this
+-- driver did until v51, and as the Frigate driver still does) silently yields
+-- nothing: the proxy was never renamed and History registration never ran.
+-- Numbers, numeric strings and tables are all accepted defensively.
+local function proxyDeviceId()
+    local ok, r = pcall(function() return C4:GetProxyDevices() end)
+    if not ok or r == nil then return nil end
+    if type(r) == "number" then return r end
+    if type(r) == "string" then return tonumber(r:match("%d+")) end
+    if type(r) == "table" then
+        local k, v = next(r)
+        return tonumber(k) or tonumber(v)
+    end
+end
+
+--=============================================================================
+-- History (the event timeline in the Control4 app and on touchscreens)
+--
+-- Two findings from the Frigate driver, both relevant on OS 3.4.3:
+--  * Records only appear in Navigator if their category, subcategory and type
+--    were registered with C4:RegisterEvents first. Unregistered records reach
+--    the History agent but stay invisible in the app.
+--  * The optional metadata argument to C4:RecordHistory stopped records being
+--    stored at all on 3.4.3. Only the four-argument form is used.
+--=============================================================================
+local HISTORY_CATEGORY    = "Cameras"
+local HISTORY_SUBCATEGORY = "UniFi Protect"
+local HISTORY_TYPES = {
+    person   = "Person Detected",
+    vehicle  = "Vehicle Detected",
+    animal   = "Animal Detected",
+    package  = "Package Detected",
+    motion   = "Motion Detected",
+    doorbell = "Doorbell Pressed",
+}
+local HISTORY_ORDER = { "person", "vehicle", "animal", "package", "motion", "doorbell" }
+
+-- The name shown in History entries. Field-verified on OS 3.4.3: History
+-- labels records with the driver's definition name ("UniFi Protect Camera
+-- (Standalone)") and ignores renaming either device. So the camera's name has
+-- to be in the entry itself. Uses the Composer-visible device's name when the
+-- installer chose one, otherwise the Protect camera name.
+local function historyName()
+    local pid = proxyDeviceId()
+    if pid then
+        local ok, n = pcall(function() return C4:GetDeviceDisplayName(pid) end)
+        if ok and n and n ~= "" and not tostring(n):find("^UniFi Protect Camera") then
+            return tostring(n)
+        end
+    end
+    return g.cameraName or ""
+end
+
+local function historyLabel(kind, name)
+    local base = HISTORY_TYPES[kind]
+    if not base then return nil end
+    name = name or historyName()
+    if name ~= "" then return base .. " \194\183 " .. name end   -- " · "
+    return base
+end
+
+local registerHistoryEvents   -- forward declaration; defined below
+
+local function recordHistory(kind)
+    if not g.history[kind] then return end
+    local name = historyName()
+    local label = historyLabel(kind, name)
+    if not label then return end
+    -- Types are per camera now, so a new name needs registering again.
+    if name ~= g.historyRegisteredName then
+        g.historyRegistered = false
+        registerHistoryEvents()
+    end
+    -- Cooldown per type: a detection flickering on and off must not write a
+    -- record each time. That would load the History database on Director and
+    -- bury the timeline.
+    local now = os.time()
+    if g.historyLast[kind] and (now - g.historyLast[kind]) < g.historyCooldown then
+        g.stats.historySkipped = g.stats.historySkipped + 1
+        return
+    end
+    g.historyLast[kind] = now
+    local ok, uuid = pcall(function()
+        return C4:RecordHistory("Info", label, HISTORY_CATEGORY, HISTORY_SUBCATEGORY)
+    end)
+    if ok and uuid and uuid ~= "" then
+        g.stats.historyRecorded = g.stats.historyRecorded + 1
+        log(LVL.DEBUG, "History: %s", label)
+    else
+        g.stats.historyFailed = g.stats.historyFailed + 1
+        log(LVL.WARN, "History record not stored (%s). Is the History agent in the project?", label)
+    end
+end
+
+local historyRegisterAttempts = 0
+function registerHistoryEvents()
+    if g.historyRegistered then return end
+    if type(C4.RegisterEvents) ~= "function" then
+        log(LVL.INFO, "History registration needs OS 3.4.0 or later")
+        return
+    end
+    local retry = function()
+        historyRegisterAttempts = historyRegisterAttempts + 1
+        -- The History agent may start after this driver; the API docs call
+        -- for retrying. Bounded so a project without the agent stops trying.
+        if historyRegisterAttempts < 20 then
+            C4:SetTimer(30000, function() registerHistoryEvents() end)
+        else
+            log(LVL.WARN, "History registration gave up. Add the History agent to the project.")
+        end
+    end
+
+    local proxyId = proxyDeviceId()
+    if not proxyId then retry(); return end
+
+    local name = historyName()
+    local types = {}
+    for _, k in ipairs(HISTORY_ORDER) do
+        types[#types + 1] = '<type name="' .. xmlAttr(historyLabel(k, name)) .. '"/>'
+    end
+    local xml = '<events><device id="' .. tostring(proxyId) .. '"/>'
+        .. '<categories><category name="' .. HISTORY_CATEGORY .. '">'
+        .. '<subcategories><subcategory name="' .. HISTORY_SUBCATEGORY .. '">'
+        .. '<types>' .. table.concat(types) .. '</types>'
+        .. '</subcategory></subcategories></category></categories></events>'
+
+    local rok, result = pcall(function() return C4:RegisterEvents(xml) end)
+    -- Documented as returning true; a shipping driver checks for 0. Accept both.
+    if rok and (result == true or result == 0) then
+        g.historyRegistered = true
+        g.historyRegisteredName = name
+        historyRegisterAttempts = 0
+        log(LVL.INFO, "History events registered")
+    else
+        retry()
+    end
+end
+
 local EVENT_MAP = {
     motion   = { var = "MOTION_DETECTED",   event = 1, endEvent = 2 },
     person   = { var = "PERSON_DETECTED",   event = 3 },
     vehicle  = { var = "VEHICLE_DETECTED",  event = 4 },
     animal   = { var = "ANIMAL_DETECTED",   event = 5 },
     package  = { var = "PACKAGE_DETECTED",  event = 6 },
-    -- A ring is a discrete act: every ring fires, even inside the hold window.
-    doorbell = { var = "DOORBELL_RING",     event = 7, discrete = true },
+    doorbell = { var = "DOORBELL_RING",     event = 7 },
 }
 
+-- Clears a detection. Cancels the watchdog so a real end-of-event (which the
+-- event socket provides) is not followed seconds later by a second "Ended"
+-- from the stale timer, and does nothing if the detection was not active.
 local function clearEvent(kind)
     local m = EVENT_MAP[kind]
     if not m then return end
+    if g.holdTimers[kind] then
+        g.holdTimers[kind]:Cancel()
+        g.holdTimers[kind] = nil
+    end
+    if not g.active[kind] then return end
+    g.active[kind] = false
     C4:SetVariable(m.var, "false")
     if m.endEvent then C4:FireEvent(m.endEvent) end
-    g.active[kind] = nil
-    g.holdTimers[kind] = nil
     log(LVL.DEBUG, "Cleared %s", kind)
 end
 
-local function fireEvent(kind)
+-- holdSec overrides the watchdog. Polled detections have no end, so the short
+-- Event Hold Time decides when they clear. Socket detections do have an end,
+-- so their watchdog is only a safety net for an end that never arrives.
+local function fireEvent(kind, holdSec)
     local m = EVENT_MAP[kind]
     if not m then
         log(LVL.TRACE, "Ignoring unknown event type '%s'", tostring(kind))
         return
     end
+    -- Detect toggles cover every kind, motion and doorbell included.
+    if g.detect[kind] == false then return end
     log(LVL.INFO, "Event: %s", kind)
-    -- Activity rarely arrives alone: poll quickly for a short window so the
-    -- follow-up detections and the end-of-event are caught promptly.
-    if g.adaptive then g.fastUntil = os.time() + g.burstSeconds end
-
-    -- Protect keeps advancing its timestamps for as long as activity lasts.
-    -- Fire the event once per episode, not once per poll: every FireEvent
-    -- makes Director re-evaluate the project's programming. Further activity
-    -- only extends the hold window below.
-    if m.discrete or not g.active[kind] then
-        g.active[kind] = true
-        C4:SetVariable(m.var, "true")
-        C4:FireEvent(m.event)
-    end
+    -- Adaptive polling speeds up after an event to catch what follows. While
+    -- the event socket is live that is pure waste: the socket already has it,
+    -- and polled detections are discarded. So only burst when it is not.
+    if g.adaptive and not g.wsOpen then g.fastUntil = os.time() + g.burstSeconds end
+    local already = g.active[kind]
+    g.active[kind] = true
+    C4:SetVariable(m.var, "true")
+    C4:FireEvent(m.event)
+    if not already then recordHistory(kind) end
 
     -- Per-event watchdog. A shared timer would clear unrelated state.
     if g.holdTimers[kind] then g.holdTimers[kind]:Cancel() end
-    g.holdTimers[kind] = C4:SetTimer(g.holdTime * 1000, function()
+    g.holdTimers[kind] = C4:SetTimer((holdSec or g.holdTime) * 1000, function()
+        g.holdTimers[kind] = nil
         clearEvent(kind)
     end)
 end
 
-local function handleCameraState(cam)
-    if type(cam) ~= "table" then return end
+--=============================================================================
+-- Event stream: WebSocket to Protect's /v1/subscribe/events
+--
+-- Protect pushes every detection the moment it happens, with a real end time.
+-- That replaces polling: no periodic API calls (the load behind HTTP 429s) and
+-- sub-second events. Polling remains available as a fallback, and while the
+-- socket is open any events it would produce are suppressed to avoid doubles.
+--
+-- DriverWorks has no WebSocket API. This is RFC 6455 over a TLS network
+-- connection, which DriverWorks does provide (CreateNetworkConnection "SSL";
+-- certificate verification is off by default, which Protect's self-signed
+-- certificate needs). Received data can arrive split or merged arbitrarily,
+-- so everything goes through a buffer.
+--=============================================================================
+local WS_BINDING   = 6001
+local WS_PORT      = 443
+local WS_PATH      = "/proxy/protect/integration/v1/subscribe/events"
+local WS_MAX_BUF   = 1024 * 1024   -- a runaway buffer means a broken stream
+local WS_PING_SEC  = 30
+local WS_DEAD_SEC  = 95            -- no traffic this long: assume the link died
+local WS_SAFETY_HOLD = 120         -- socket events carry an end; this is a backstop
 
-    -- A reply with no connection state is truncated, or not a camera object.
-    -- Acting on it would report the camera offline and then online again, and
-    -- would record a bogus baseline timestamp.
-    if cam.state == nil and cam.isConnected == nil then
-        log(LVL.TRACE, "Camera reply has no connection state; ignored")
+-- smartDetectTypes values Protect uses, mapped to our event kinds. Anything
+-- else (face, licensePlate, ...) is logged rather than guessed at.
+local SMART_KINDS = { person = "person", vehicle = "vehicle", animal = "animal", package = "package" }
+
+-- Pure-Lua helpers: Lua 5.1 has no bit operators and DriverWorks documents no
+-- base64 encoder. Both are only used on tiny inputs.
+local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local function base64(data)
+    return ((data:gsub('.', function(x)
+        local r, b = '', x:byte()
+        for i = 8, 1, -1 do r = r .. (b % 2 ^ i - b % 2 ^ (i - 1) > 0 and '1' or '0') end
+        return r
+    end) .. '0000'):gsub('%d%d%d?%d?%d?%d?', function(x)
+        if #x < 6 then return '' end
+        local c = 0
+        for i = 1, 6 do c = c + (x:sub(i, i) == '1' and 2 ^ (6 - i) or 0) end
+        return B64:sub(c + 1, c + 1)
+    end) .. ({ '', '==', '=' })[#data % 3 + 1])
+end
+
+local function bxor(a, b)
+    local r, bit = 0, 1
+    while a > 0 or b > 0 do
+        local x, y = a % 2, b % 2
+        if x ~= y then r = r + bit end
+        a, b, bit = (a - x) / 2, (b - y) / 2, bit * 2
+    end
+    return r
+end
+
+local function randomBytes(n)
+    local t = {}
+    for i = 1, n do t[i] = string.char(math.random(0, 255)) end
+    return table.concat(t)
+end
+
+-- Client-to-server frames must be masked (RFC 6455 5.3).
+local function wsFrame(opcode, payload)
+    payload = payload or ""
+    local len = #payload
+    local head = string.char(128 + opcode)          -- FIN + opcode
+    if len < 126 then
+        head = head .. string.char(128 + len)
+    elseif len < 65536 then
+        head = head .. string.char(128 + 126, math.floor(len / 256), len % 256)
+    else
+        return nil   -- nothing we send is anywhere near this large
+    end
+    local key = randomBytes(4)
+    local out = {}
+    for i = 1, len do
+        local k = key:byte((i - 1) % 4 + 1)
+        out[i] = string.char(bxor(payload:byte(i), k))
+    end
+    return head .. key .. table.concat(out)
+end
+
+local ws = { state = "off", buf = "", frag = nil, backoff = 1, lastRx = 0,
+             seen = {}, timer = nil, pingTimer = nil }
+
+local function wsSetState(state, detail)
+    ws.state = state
+    g.wsOpen = (state == "open")
+    local label = ({
+        off        = "Off",
+        connecting = "Connecting...",
+        handshake  = "Connecting...",
+        open       = "Connected",
+        waiting    = "Reconnecting",
+        auth       = "Auth failed - check API Key",
+    })[state] or state
+    if detail then label = label .. " " .. detail end
+    C4:UpdateProperty("Event Stream", label)
+end
+
+local function wsEnabled()
+    return g.eventSource == "WebSocket (instant)"
+       and g.address ~= "" and g.apiKey ~= ""
+end
+
+local wsConnect   -- forward declaration
+
+local function wsCancelTimers()
+    if ws.timer then ws.timer:Cancel(); ws.timer = nil end
+    if ws.pingTimer then ws.pingTimer:Cancel(); ws.pingTimer = nil end
+end
+
+local function wsScheduleReconnect()
+    wsCancelTimers()
+    if not wsEnabled() then wsSetState("off"); return end
+    -- Exponential backoff with jitter; capped so a long outage recovers within
+    -- a couple of minutes of the console coming back.
+    local delay = math.min(ws.backoff, 120) + math.random(0, 3)
+    ws.backoff = math.min(ws.backoff * 2, 120)
+    wsSetState("waiting", "in " .. delay .. "s")
+    log(LVL.INFO, "Event stream: reconnecting in %ds", delay)
+    ws.timer = C4:SetTimer(delay * 1000, function()
+        ws.timer = nil
+        wsConnect()
+    end)
+end
+
+local function wsClose(reconnect)
+    wsCancelTimers()
+    if ws.state ~= "off" then pcall(function() C4:NetDisconnect(WS_BINDING, WS_PORT) end) end
+    ws.buf, ws.frag = "", nil
+    if reconnect then wsScheduleReconnect() else wsSetState("off") end
+end
+
+local function wsSend(opcode, payload)
+    local f = wsFrame(opcode, payload)
+    if f then C4:SendToNetwork(WS_BINDING, WS_PORT, f) end
+end
+
+-- One Protect event message. Returns nothing; errors are contained by caller.
+local function wsHandleMessage(text)
+    g.stats.wsMessages = g.stats.wsMessages + 1
+    -- Every camera's events arrive on every camera's connection. A plain
+    -- substring check discards the others before the pure-Lua JSON decode,
+    -- so eight drivers don't each fully parse all eight cameras' traffic.
+    if g.cameraId == "" or not text:find(g.cameraId, 1, true) then
+        g.stats.wsIgnored = g.stats.wsIgnored + 1
+        return
+    end
+    g.stats.wsDecoded = g.stats.wsDecoded + 1
+    local msg = Json.decode(text)
+    if type(msg) ~= "table" or type(msg.item) ~= "table" then
+        log(LVL.DEBUG, "Event stream: ignoring non-event message")
+        return
+    end
+    local it = msg.item
+    if it.device ~= g.cameraId or g.cameraId == "" then return end
+
+    local id    = tostring(it.id or "")
+    local etype = tostring(it.type or "")
+    local ended = (it["end"] ~= nil)     -- JSON null decodes to nil
+
+    -- Remember each event id past its end: a ring arrives with its end already
+    -- set, and Protect can repeat a message, so forgetting the id on "end"
+    -- made the repeat fire the doorbell twice. Old ids are pruned by age.
+    local seen = ws.seen[id]
+    if not seen then
+        seen = { at = os.time() }
+        ws.seen[id] = seen
+        ws.seenCount = (ws.seenCount or 0) + 1
+        if ws.seenCount > 200 then
+            local cutoff = os.time() - 600
+            for k, v in pairs(ws.seen) do
+                if v.at < cutoff then ws.seen[k] = nil; ws.seenCount = ws.seenCount - 1 end
+            end
+        end
+    end
+    -- A late update for an event that already ended must not restart it.
+    if seen.ended and not ended then return end
+
+    if etype == "ring" then
+        -- Rings arrive with start and end together; fire once per event id.
+        if not seen.ring then
+            seen.ring = true
+            fireEvent("doorbell", g.holdTime)
+        end
+
+    elseif etype == "motion" then
+        if ended then
+            clearEvent("motion")
+        elseif not seen.motion then
+            seen.motion = true
+            fireEvent("motion", WS_SAFETY_HOLD)
+        end
+
+    elseif etype:find("^smartDetect") then
+        -- Zone, line and loiter detections all carry smartDetectTypes, which
+        -- can grow across updates (e.g. face, then face and person).
+        local types = type(it.smartDetectTypes) == "table" and it.smartDetectTypes or {}
+        for _, t in ipairs(types) do
+            local kind = SMART_KINDS[tostring(t)]
+            if kind then
+                if ended then
+                    clearEvent(kind)
+                elseif not seen[kind] and g.detect[kind] then
+                    seen[kind] = true
+                    fireEvent(kind, WS_SAFETY_HOLD)
+                end
+            elseif not seen["unmapped:" .. tostring(t)] then
+                -- Updates repeat the whole class list; say it once per detection.
+                seen["unmapped:" .. tostring(t)] = true
+                log(LVL.DEBUG, "Event stream: smart detection '%s' not mapped", tostring(t))
+            end
+        end
+
+    else
+        log(LVL.INFO, "Event stream: unhandled event type '%s' - please report it", etype)
+    end
+
+    if ended then seen.ended = true end
+end
+
+-- Parses as many complete frames as the buffer holds.
+local function wsDrain()
+    local buf, p = ws.buf, 1
+    local n = #buf
+    while true do
+        if n - p + 1 < 2 then break end
+        local b1, b2 = buf:byte(p, p + 1)
+        local fin, opcode = b1 >= 128, b1 % 16
+        local masked, len = b2 >= 128, b2 % 128
+        local pos = p + 2
+        if len == 126 then
+            if n < p + 3 then break end
+            len = buf:byte(p + 2) * 256 + buf:byte(p + 3)
+            pos = p + 4
+        elseif len == 127 then
+            if n < p + 9 then break end
+            len = 0
+            for i = p + 2, p + 9 do len = len * 256 + buf:byte(i) end
+            pos = p + 10
+        end
+        local key
+        if masked then
+            if n < pos + 3 then break end
+            key = buf:sub(pos, pos + 3)
+            pos = pos + 4
+        end
+        if n < pos + len - 1 then break end             -- frame not complete yet
+
+        local payload = buf:sub(pos, pos + len - 1)
+        p = pos + len
+        if key then                                     -- servers should not mask
+            local out = {}
+            for i = 1, #payload do
+                out[i] = string.char(bxor(payload:byte(i), key:byte((i - 1) % 4 + 1)))
+            end
+            payload = table.concat(out)
+        end
+
+        if opcode == 1 or (opcode == 0 and ws.frag) then
+            ws.frag = (ws.frag or "") .. payload
+            if fin then
+                local text = ws.frag
+                ws.frag = nil
+                local ok, err = pcall(wsHandleMessage, text)
+                if not ok then log(LVL.ERROR, "Event stream: bad message: %s", tostring(err)) end
+            end
+        elseif opcode == 9 then
+            wsSend(10, payload)                         -- ping -> pong
+        elseif opcode == 10 then
+            -- pong: liveness already recorded
+        elseif opcode == 8 then
+            log(LVL.INFO, "Event stream: server closed the connection")
+            pcall(wsSend, 8, "")
+            wsClose(true)                               -- resets the buffer
+            return
+        else
+            log(LVL.DEBUG, "Event stream: ignoring opcode %d", opcode)
+        end
+    end
+    ws.buf = (p > 1) and buf:sub(p) or buf
+end
+
+local function wsStartPings()
+    if ws.pingTimer then ws.pingTimer:Cancel() end
+    ws.pingTimer = C4:SetTimer(WS_PING_SEC * 1000, function()
+        if ws.state ~= "open" then return end
+        if os.time() - ws.lastRx > WS_DEAD_SEC then
+            log(LVL.WARN, "Event stream: no traffic for %ds, reconnecting", WS_DEAD_SEC)
+            wsClose(true)
+            return
+        end
+        wsSend(9, "")
+    end, true)
+end
+
+function wsConnect()
+    wsCancelTimers()
+    if not wsEnabled() then wsSetState("off"); return end
+    ws.buf, ws.frag, ws.seen, ws.seenCount = "", nil, {}, 0
+    wsSetState("connecting")
+    C4:CreateNetworkConnection(WS_BINDING, g.address, "SSL")
+    C4:NetPortOptions(WS_BINDING, WS_PORT, "SSL", {
+        VERIFY_MODE     = "none",    -- Protect's certificate is self-signed
+        AUTO_CONNECT    = false,
+        KEEP_CONNECTION = false,     -- reconnects are ours, with backoff
+        MONITOR_CONNECTION = false,
+    })
+    C4:NetConnect(WS_BINDING, WS_PORT)
+    -- If nothing happens, try again rather than sit in "Connecting" forever.
+    ws.timer = C4:SetTimer(20000, function()
+        ws.timer = nil
+        if ws.state == "connecting" or ws.state == "handshake" then
+            log(LVL.WARN, "Event stream: connection attempt timed out")
+            wsClose(true)
+        end
+    end)
+end
+
+local function wsSendHandshake()
+    ws.key = base64(randomBytes(16))
+    local req = table.concat({
+        "GET " .. WS_PATH .. " HTTP/1.1",
+        "Host: " .. g.address,
+        "Upgrade: websocket",
+        "Connection: Upgrade",
+        "Sec-WebSocket-Key: " .. ws.key,
+        "Sec-WebSocket-Version: 13",
+        "X-API-KEY: " .. g.apiKey,
+        "", "",
+    }, "\r\n")
+    wsSetState("handshake")
+    C4:SendToNetwork(WS_BINDING, WS_PORT, req)
+end
+
+function OnConnectionStatusChanged(idBinding, nPort, strStatus)
+    if idBinding ~= WS_BINDING then return end
+    if strStatus == "ONLINE" then
+        if ws.state == "connecting" then wsSendHandshake() end
+    else
+        if ws.state ~= "off" and ws.state ~= "waiting" and ws.state ~= "auth" then
+            log(LVL.INFO, "Event stream: connection dropped")
+            wsClose(true)
+        end
+    end
+end
+
+function ReceivedFromNetwork(idBinding, nPort, strData)
+    if idBinding ~= WS_BINDING or ws.state == "off" then return end
+    ws.lastRx = os.time()
+    ws.buf = ws.buf .. strData
+    if #ws.buf > WS_MAX_BUF then
+        log(LVL.ERROR, "Event stream: buffer overflow, reconnecting")
+        wsClose(true)
         return
     end
 
-    if type(cam.name) == "string" and cam.name ~= "" then
+    if ws.state == "handshake" then
+        local headEnd = ws.buf:find("\r\n\r\n", 1, true)
+        if not headEnd then return end                  -- headers still arriving
+        local head = ws.buf:sub(1, headEnd - 1)
+        ws.buf = ws.buf:sub(headEnd + 4)                -- a frame may follow at once
+        local code = tonumber(head:match("^HTTP/%d%.%d (%d%d%d)") or "")
+        if code == 101 then
+            ws.backoff = 1
+            wsSetState("open")
+            log(LVL.INFO, "Event stream connected")
+            wsStartPings()
+        elseif code == 401 or code == 403 then
+            -- Retrying quickly with a bad key only gets it throttled.
+            log(LVL.ERROR, "Event stream refused the API key (HTTP %d)", code)
+            ws.backoff = 120
+            wsSetState("auth")
+            pcall(function() C4:NetDisconnect(WS_BINDING, WS_PORT) end)
+            ws.timer = C4:SetTimer(300000, function() ws.timer = nil; wsConnect() end)
+            return
+        else
+            log(LVL.ERROR, "Event stream handshake failed: %s", head:match("^[^\r\n]*") or "?")
+            wsClose(true)
+            return
+        end
+    end
+
+    if ws.state == "open" then
+        local ok, err = pcall(wsDrain)
+        if not ok then
+            log(LVL.ERROR, "Event stream parse error: %s", tostring(err))
+            wsClose(true)
+        end
+    end
+end
+
+-- (Re)start the stream after anything that changes where or how it connects.
+local function wsRestart()
+    wsClose(false)
+    ws.backoff = 1
+    if wsEnabled() then wsConnect() end
+end
+
+-- True while the socket is delivering events, so polling can stand down.
+local function wsLive() return ws.state == "open" end
+
+local syncDeviceName   -- forward declaration; defined with the naming rules below
+
+local function handleCameraState(cam)
+    if type(cam) ~= "table" then return end
+
+    if cam.name and cam.name ~= "" and cam.name ~= g.cameraName then
+        g.cameraName = cam.name
         C4:UpdateProperty("Camera Name", cam.name)
+        syncDeviceName(false)
     end
 
     local isOnline = (cam.state == "CONNECTED") or (cam.isConnected == true)
-    if g.online == nil then
-        -- First valid reply since load or a camera change: record the state,
-        -- but do not announce it. Otherwise every restart fires "online".
-        g.online = isOnline
-        g.cameraOffline = not isOnline
-        computeStatus()
-    elseif isOnline ~= g.online then
+    if isOnline ~= g.online then
         g.online = isOnline
         C4:FireEvent(isOnline and 9 or 8)
         g.cameraOffline = not isOnline
         computeStatus()
         log(LVL.INFO, "Camera %s", isOnline and "online" or "offline")
-        -- Stream tokens can change while a camera is away (RTSP toggled,
-        -- Protect updated). Re-read them, but never auto-enable.
-        if isOnline and g.cameraId ~= "" and g.aliasState ~= "pending"
-           and g.aliasState ~= "enabling" then
-            fetchAliases(true)
-        end
     end
 
-    -- Timestamps are epoch milliseconds. The first valid reply is a baseline
-    -- even when the field is 0 or absent (a doorbell that has never rung);
-    -- otherwise the first real event after load would be taken for the
-    -- baseline and silently dropped.
+    -- Timestamps are epoch milliseconds. Fire only when they advance.
+    -- Detections come from the event socket when it is live; polling then only
+    -- tracks online/offline. Firing here too would double every event.
+    local pollEvents = (g.eventSource ~= "Off") and not wsLive()
+
     local function checkStamp(key, kind, enabled)
+        local ts = cam[key]
+        if type(ts) ~= "number" or ts == 0 then return end
         if enabled == false then return end
-        local ts = type(cam[key]) == "number" and cam[key] or 0
-        local seen = g.lastSeen[kind]
-        if seen == nil then
-            g.lastSeen[kind] = ts        -- baseline; never replay history
-        elseif ts > seen then
-            g.lastSeen[kind] = ts
-            fireEvent(kind)
-        end
+        if g.lastSeen[kind] and ts <= g.lastSeen[kind] then return end
+        local first = (g.lastSeen[kind] == nil)
+        g.lastSeen[kind] = ts
+        -- Don't replay history on the first poll after a driver restart.
+        if not first and pollEvents then fireEvent(kind) end
     end
 
     checkStamp("lastMotion", "motion", true)
@@ -1107,16 +1600,11 @@ local function handleCameraState(cam)
     -- bootstrap; unrecognised shapes are logged at Trace and ignored.
     local ts = cam.lastSmartDetect or cam.lastSmartDetectAt
     local types = cam.lastSmartDetectTypes or cam.smartDetectTypes
-    local tsn = type(ts) == "number" and ts or 0
-    if g.lastSeen.smart == nil then
-        g.lastSeen.smart = tsn
-        if tsn > 0 and type(types) ~= "table" then
-            log(LVL.WARN, "Smart detections present but no type list found - " ..
-                "person/vehicle/animal/package events will not fire. Raise Log Level to Trace and report the payload shape.")
-        end
-    elseif tsn > g.lastSeen.smart then
-        g.lastSeen.smart = tsn
-        if type(types) == "table" then
+    if type(ts) == "number" and ts > 0 and type(types) == "table" then
+        local advanced = not (g.lastSeen.smart and ts <= g.lastSeen.smart)
+        local first = (g.lastSeen.smart == nil)
+        g.lastSeen.smart = ts
+        if advanced and not first and pollEvents then
             for _, t in ipairs(types) do
                 local kind = tostring(t):lower()
                 if kind == "person" and g.detect.person then fireEvent("person")
@@ -1126,18 +1614,26 @@ local function handleCameraState(cam)
                 else log(LVL.TRACE, "Smart detect class not handled: %s", kind) end
             end
         end
+    elseif type(ts) == "number" and ts > 0 and g.lastSeen.smart == nil then
+        log(LVL.WARN, "Smart detections present but no type list found - " ..
+            "person/vehicle/animal/package events will not fire. Raise Log Level to Trace and report the payload shape.")
+        g.lastSeen.smart = ts
     end
 end
 
 -- Self-scheduling poll. A repeating timer can stack requests if the console
 -- is slow to answer; this chains one-shot timers and skips a tick while a
 -- request is still in flight.
-local function schedulePoll(delayOverride)
+local function schedulePoll()
     if g.pollTimer then g.pollTimer:Cancel(); g.pollTimer = nil end
     if g.pollInterval == 0 then return end
 
-    local delay = delayOverride or g.pollInterval
-    if not delayOverride and g.adaptive and g.fastUntil and os.time() < g.fastUntil then
+    local delay = g.pollInterval
+    if g.wsOpen then
+        -- The socket delivers detections; polling is only confirming the
+        -- camera is online, which does not need more than once a minute.
+        delay = math.max(delay, 60000)
+    elseif g.adaptive and g.fastUntil and os.time() < g.fastUntil then
         delay = 1000
     end
 
@@ -1146,8 +1642,6 @@ local function schedulePoll(delayOverride)
         pcall(poll)
     end)
 end
-
-local POLL_STALL_SEC = 60
 
 function poll()
     if g.cameraId == "" or g.address == "" then
@@ -1160,45 +1654,19 @@ function poll()
         return
     end
     g.pollBusy = true
-    g.pollStartedAt = os.time()
-    local seq = g.pollSeq + 1
-    g.pollSeq = seq
-
-    -- Watchdog. The next tick is only scheduled when a reply arrives, so a
-    -- reply that never comes (OnDone not delivered) would otherwise end
-    -- polling silently.
-    if g.pollWatch then g.pollWatch:Cancel() end
-    g.pollWatch = C4:SetTimer(POLL_STALL_SEC * 1000, function()
-        g.pollWatch = nil
-        if g.pollSeq == seq and g.pollBusy then
-            log(LVL.WARN, "No reply to the event poll for %ds; abandoning it", POLL_STALL_SEC)
-            g.pollSeq = g.pollSeq + 1      -- a late reply is now ignored
-            g.pollBusy, g.pollStartedAt = false, nil
-            schedulePoll()
-        end
-    end)
 
     ensureSession(function(ok)
         if not ok then
-            if g.pollWatch then g.pollWatch:Cancel(); g.pollWatch = nil end
-            g.pollBusy, g.pollStartedAt = false, nil
+            g.pollBusy = false
             schedulePoll()
             return
         end
         request("GET", basePath() .. "/cameras/" .. g.cameraId, nil,
             function(success, data, code)
-                -- Superseded: the camera changed, or the watchdog gave up on
-                -- this poll. A new chain owns the schedule now.
-                if seq ~= g.pollSeq then return end
-                if g.pollWatch then g.pollWatch:Cancel(); g.pollWatch = nil end
-                g.pollBusy, g.pollStartedAt = false, nil
+                g.pollBusy = false
                 if success then
-                    -- An error here must not end the chain: the next tick is
-                    -- only scheduled below.
-                    local handled, err = pcall(handleCameraState, data)
-                    if not handled then
-                        log(LVL.ERROR, "Event handling failed: %s", tostring(err))
-                    end
+                    handleCameraState(data)
+                elseif code == 401 then
                 end
                 schedulePoll()
             end, true)   -- quiet: this runs continuously
@@ -1218,42 +1686,7 @@ local function startPolling()
     if g.adaptive then note = note .. " (bursts to 3600 briefly after an event)" end
     C4:UpdateProperty("API Call Rate", note)
     log(LVL.INFO, "Polling every %dms - about %s", g.pollInterval, note)
-    -- Every camera driver on the controller starts together; spread the first
-    -- poll so they do not all hit the console in the same instant.
-    schedulePoll(math.random(250, math.min(g.pollInterval, 5000)))
-end
-
--- Polling needs a console, a key and a camera. It does not need stream
--- aliases (events work without RTSP). Called after anything that can complete
--- that set, so a camera configured after load starts polling without a reload.
-local function ensurePolling()
-    if g.initializing or g.pollInterval == 0 then return end
-    if g.address == "" or g.apiKey == "" or g.cameraId == "" then return end
-    if g.pollTimer or g.pollBusy then return end
-    startPolling()
-end
-
--- Every place that changes camera must reset the same state, and must make
--- replies to requests issued for the OLD camera harmless: an alias reply for
--- the previous camera used to overwrite the new camera's stream token.
-local function setCameraId(id)
-    g.cameraId = id
-    g.gen = g.gen + 1
-    g.pollSeq = g.pollSeq + 1
-    if g.pollTimer then g.pollTimer:Cancel(); g.pollTimer = nil end
-    g.pollBusy, g.pollStartedAt = false, nil
-    if g.pollWatch then g.pollWatch:Cancel(); g.pollWatch = nil end
-    g.rtspEnableTried = false
-    g.lastSeen, g.active = {}, {}
-    g.online, g.cameraOffline = nil, false
-    g.aliasState = "idle"
-    g.aliases = { Low = "", Medium = "", High = "" }
-    for _, q in ipairs(QUALITY_ORDER) do
-        C4:UpdateProperty("RTSP Alias - " .. q, "")
-    end
-    -- The cached frame and any fetch in flight belong to the old camera.
-    g.snapData, g.snapTime, g.snapFetching = nil, nil, false
-    flushSnapWaiters(false)
+    schedulePoll()
 end
 
 --=============================================================================
@@ -1392,8 +1825,8 @@ local function afterStreams()
 end
 
 -- No quality has RTSP enabled. Turn it on once if allowed, else say so.
-local function noStreamsFound(noEnable)
-    if g.autoEnableRtsp and not g.rtspEnableTried and not noEnable then
+local function noStreamsFound()
+    if g.autoEnableRtsp and not g.rtspEnableTried then
         g.rtspEnableTried = true
         log(LVL.INFO, "No RTSP stream is enabled for this camera - enabling it in Protect")
         enableRtspStreams()
@@ -1407,20 +1840,14 @@ end
 
 -- Integration API: GET /cameras/{id}/rtsps-stream returns quality -> rtsps://
 -- URL. Qualities that are not enabled are absent or null.
--- refresh=true: re-reading tokens we already hold. Quiet about it, and never
--- turns RTSP on in Protect as a side effect.
-local function fetchAliasesIntegration(refresh)
-    if not refresh then
-        g.aliasState = "pending"
-        computeStatus()
-    end
-    local gen = g.gen
+local function fetchAliasesIntegration()
+    g.aliasState = "pending"
+    computeStatus()
     request("GET", basePath() .. "/cameras/" .. g.cameraId .. "/rtsps-stream", nil,
         function(success, data, code, raw)
-            if gen ~= g.gen then return end   -- reply for a camera we have left
             if not success then
                 if code == 404 then
-                    noStreamsFound(refresh)    -- RTSP off, or the API is missing
+                    noStreamsFound()           -- RTSP off, or the API is missing
                 elseif code == 429 then
                     -- Retries exhausted. Do NOT follow up with another request
                     -- to a console that is already refusing them.
@@ -1457,7 +1884,7 @@ local function fetchAliasesIntegration(refresh)
             end
 
             if found == 0 then
-                noStreamsFound(refresh)
+                noStreamsFound()
             else
                 -- This branch used to leave the status untouched, so an earlier
                 -- "No RTSP alias" outlived the aliases arriving.
@@ -1470,14 +1897,14 @@ local function fetchAliasesIntegration(refresh)
         end)
 end
 
-function fetchAliases(refresh)
+function fetchAliases()
     if g.cameraId == "" then
         log(LVL.ERROR, "Select a camera before fetching aliases")
         return
     end
     ensureSession(function(ok)
         if not ok then return end
-        fetchAliasesIntegration(refresh)
+        fetchAliasesIntegration()
     end)
 end
 
@@ -1503,6 +1930,13 @@ local function rawGet(url, headers, cb)
         :Get(url, headers or {})
 end
 
+-- Counters since the driver started, so load is visible rather than assumed.
+function GetDriverStats()
+    local t = {}
+    for k, v in pairs(g.stats) do t[k] = v end
+    return t
+end
+
 local function runDiagnostics()
     local P = function(t) print("[UniFiProtect] " .. t) end
     P("================ DIAGNOSTICS ================")
@@ -1511,6 +1945,18 @@ local function runDiagnostics()
       "  Medium=" .. (g.aliases.Medium ~= "" and g.aliases.Medium or "-") ..
       "  High=" .. (g.aliases.High ~= "" and g.aliases.High or "-"))
     P("Stream URL: rtsp://" .. g.address .. ":" .. g.rtspPort .. "/<token>")
+    local pid = proxyDeviceId()
+    local okp, pname = pcall(function() return pid and C4:GetDeviceDisplayName(pid) end)
+    local okd, dname = pcall(function() return C4:GetDeviceDisplayName(C4:GetDeviceID()) end)
+    P(string.format("Names: camera='%s'  proxy=%s '%s'  driver=%s '%s'",
+        tostring(g.cameraName), tostring(pid), tostring(okp and pname),
+        tostring(C4:GetDeviceID()), tostring(okd and dname)))
+    local st = g.stats
+    P(string.format("Load since start: %d requests to Protect", st.apiRequests))
+    P(string.format("Event stream: %d messages, %d for this camera, %d for others (skipped unparsed)",
+        st.wsMessages, st.wsDecoded, st.wsIgnored))
+    P(string.format("History: %d recorded, %d held back by cooldown, %d failed",
+        st.historyRecorded, st.historySkipped, st.historyFailed))
     if g.rtspPort ~= 7447 then
         P("    ^^ WRONG PORT. Protect serves RTSP on 7447; fix it on the Camera Properties tab.")
     end
@@ -1556,10 +2002,8 @@ function enableRtspStreams()
         g.aliasState = "enabling"
         computeStatus()
         local body = '{"qualities":["high","medium","low"]}'
-        local gen = g.gen
         request("POST", basePath() .. "/cameras/" .. g.cameraId .. "/rtsps-stream", body,
             function(success, data, code, raw)
-                if gen ~= g.gen then return end   -- camera changed meanwhile
                 if not success then
                     log(LVL.ERROR, "Could not enable RTSP (HTTP %s): %s",
                         tostring(code), tostring(raw):sub(1, 200))
@@ -1572,6 +2016,64 @@ function enableRtspStreams()
 end
 
 local validate   -- forward declaration; defined further down
+
+--=============================================================================
+-- Device name
+--
+-- History entries, like everything in Navigator, are labelled with the
+-- device's name. A camera added by hand keeps the driver's default name, so its
+-- History read "UniFi Protect Camera" rather than the camera.
+--
+-- Rules:
+--  * Rename the PROXY device - that is the one Composer and Navigator show.
+--  * Only replace a default name, or a name this driver set earlier. A name the
+--    installer chose is left alone.
+--  * C4:RenameDevice refreshes the whole project on Director, so it runs only
+--    when the name genuinely differs, and never on a timer.
+--=============================================================================
+local PERSIST_APPLIED_NAME = "applied_device_name"
+
+local function isDefaultName(n)
+    n = tostring(n or "")
+    return n == "" or n:find("^UniFi Protect Camera") ~= nil
+end
+
+
+-- force: the installer asked explicitly, so a custom name is replaced too.
+-- Renames one device if the rules allow. Returns true if it renamed.
+local function renameIfOurs(devId, want, applied, force, label)
+    local ok, current = pcall(function() return C4:GetDeviceDisplayName(devId) end)
+    if not ok then return false end
+    if current == want then return false end            -- already right: no refresh
+    local ours = isDefaultName(current) or (applied ~= nil and current == applied)
+    if not ours and not force then
+        log(LVL.INFO, "%s device is named '%s' by the installer; leaving it",
+            label, tostring(current))
+        return false
+    end
+    C4:RenameDevice(devId, want)
+    log(LVL.INFO, "%s device renamed from '%s' to '%s'", label, tostring(current), want)
+    return true
+end
+
+-- Names the Composer-visible (proxy) device after the camera, unless the
+-- installer named it. History is NOT affected by this: field-verified on OS
+-- 3.4.3, History labels records with the driver's definition name and ignores
+-- renaming either device (v50 renamed the driver device too, to no effect,
+-- and each rename refreshes the whole project). History gets the camera's name
+-- in the entry title instead - see historyLabel.
+function syncDeviceName(force)
+    local want = g.cameraName or ""
+    local applied = C4:PersistGetValue(PERSIST_APPLIED_NAME)
+    local proxyId = proxyDeviceId()
+
+    if proxyId and want ~= "" then
+        if renameIfOurs(proxyId, want, applied, force, "Proxy") then
+            C4:PersistSetValue(PERSIST_APPLIED_NAME, want)
+        end
+    end
+
+end
 
 --=============================================================================
 -- Configuration pushed by the UniFi Protect Setup driver
@@ -1600,17 +2102,20 @@ local function applyConfig(t)
 
     local newCam = t.camera_id and tostring(t.camera_id) or nil
     if newCam and newCam ~= g.cameraId then
-        setCameraId(newCam)
+        g.cameraId = newCam
+        g.rtspEnableTried = false
+        g.lastSeen = {}
+        g.aliases = { Low = "", Medium = "", High = "" }
+        for _, q in ipairs({ "Low", "Medium", "High" }) do
+            C4:UpdateProperty("RTSP Alias - " .. q, "")
+        end
         changed["Camera ID"] = true
-    end
-    -- New connection details invalidate what the status said about the old.
-    if changed["NVR Address"] or changed["API Key"] then
-        g.authFailed, g.unreachable, g.connError, g.failStreak = false, false, nil, 0
     end
     if newCam then C4:UpdateProperty("Camera ID", newCam) end
 
     if t.camera_name and t.camera_name ~= "" then
-        C4:UpdateProperty("Camera Name", tostring(t.camera_name))
+        g.cameraName = tostring(t.camera_name)
+        C4:UpdateProperty("Camera Name", g.cameraName)
         -- Keep the dropdown showing the right camera.
         g.cameraMap[tostring(t.camera_name)] = g.cameraId
         C4:UpdatePropertyList("Camera", tostring(t.camera_name), tostring(t.camera_name))
@@ -1623,6 +2128,27 @@ local function applyConfig(t)
         C4:UpdateProperty("Snapshots", want and "On" or "Off")
     end
 
+    -- Detection and History selections, pushed from the setup driver so eight
+    -- cameras are configured once. Keys: detect_<kind>, history_<kind>.
+    local KIND_PROPS = { person = "Person", vehicle = "Vehicle", animal = "Animal",
+                         package = "Package", motion = "Motion", doorbell = "Doorbell" }
+    for kind, label in pairs(KIND_PROPS) do
+        local d = t["detect_" .. kind]
+        if d ~= nil then
+            g.detect[kind] = (tostring(d) == "Yes")
+            C4:UpdateProperty("Detect " .. label, g.detect[kind] and "Yes" or "No")
+        end
+        local h = t["history_" .. kind]
+        if h ~= nil then
+            g.history[kind] = (tostring(h) == "Yes")
+            C4:UpdateProperty("History - " .. label, g.history[kind] and "Yes" or "No")
+        end
+    end
+    if t.history_cooldown ~= nil and tonumber(t.history_cooldown) then
+        g.historyCooldown = tonumber(t.history_cooldown)
+        C4:UpdateProperty("History Cooldown", tostring(g.historyCooldown))
+    end
+
     if t.enable_rtsp ~= nil then
         g.autoEnableRtsp = (tostring(t.enable_rtsp) == "Yes")
         C4:UpdateProperty("Enable RTSP Automatically", g.autoEnableRtsp and "Yes" or "No")
@@ -1630,6 +2156,7 @@ local function applyConfig(t)
     if t.parent_id then g.parentId = tonumber(t.parent_id) end
 
     log(LVL.INFO, "Configuration received from setup driver (camera %s)", g.cameraId)
+    syncDeviceName(false)
 
     -- Follow-on work, in dependency order.
     if changed["NVR Address"] then pushAddressToProxy() end
@@ -1640,9 +2167,7 @@ local function applyConfig(t)
     -- The snapshot server reads g.address / g.apiKey / g.cameraId at fetch
     -- time, so it must run after those are set. It keeps its port.
     ensureSnapshotServer()
-    -- Events need only address, key and camera. Without this a camera
-    -- configured by the setup driver would not poll until the next reload.
-    ensurePolling()
+    if changed["NVR Address"] or changed["API Key"] or ws.state == "off" then wsRestart() end
     -- No separate connection test here. The stream fetch above already
     -- proves the console answers; firing both at once, on every camera at
     -- once, is what tripped Protect's rate limit (HTTP 429). The version for
@@ -1703,6 +2228,7 @@ function ExecuteCommand(sCommand, tParams)
     elseif sCommand == "FetchAliases" then fetchAliases()
     elseif sCommand == "EnableRtsp" then enableRtspStreams()
     elseif sCommand == "Diagnostics" then runDiagnostics()
+    elseif sCommand == "UseCameraName" then syncDeviceName(true)
     elseif sCommand == "ShowUrls" then
         print("[UniFiProtect] --- what the proxy receives ---")
         print("[UniFiProtect] streams:   " .. buildStreamsXml({}))
@@ -1735,15 +2261,6 @@ local function trim(s)
     return (tostring(s or ""):gsub("^%s*(.-)%s*$", "%1"))
 end
 
--- A new address or key invalidates whatever the status said about the old
--- one: "Auth Failed" used to outlive the fix. Re-test (unless loading) so the
--- status reflects the new values.
-local function connectionSettingsChanged()
-    g.authFailed, g.unreachable, g.connError, g.failStreak = false, false, nil, 0
-    if g.initializing then return end
-    if g.address ~= "" and g.apiKey ~= "" then testConnection() end
-end
-
 -- Accepts a bare token or a full rtsps:// URL pasted from the Protect UI.
 local function cleanAlias(v)
     v = trim(v)
@@ -1758,21 +2275,27 @@ function OnPropertyChanged(name)
 
     if name == "NVR Address" then
         g.address = trim(v)
+        if not g.initializing then wsRestart() end
         pushAddressToProxy()
-        connectionSettingsChanged()
     elseif name == "API Key" then
         g.apiKey = trim(v)
-        connectionSettingsChanged()
+        if not g.initializing then wsRestart() end
     elseif name == "Camera" then
         if g.initializing then return end   -- the map is not built yet
         local id = g.cameraMap[v]
         if id and id ~= g.cameraId then
             log(LVL.INFO, "Camera selected: %s (%s)", tostring(v), tostring(id))
+            g.cameraName = v
+            C4:UpdateProperty("Camera Name", v)
             -- UpdateProperty does not re-enter OnPropertyChanged (documented),
             -- so apply the change here rather than relying on a callback.
-            setCameraId(id)
+            g.cameraId = id
+            g.rtspEnableTried = false
+            g.lastSeen = {}
+            g.aliases = { Low = "", Medium = "", High = "" }
             C4:UpdateProperty("Camera ID", id)
             fetchAliases()
+            syncDeviceName(false)
         elseif not id and v ~= NO_CAMERA then
             log(LVL.WARN, "'%s' is not in the discovered list - run Discover Cameras", tostring(v))
         end
@@ -1784,7 +2307,9 @@ function OnPropertyChanged(name)
             -- and Properties is walked in undefined order.
             g.cameraId = newId
         elseif newId ~= g.cameraId then
-            setCameraId(newId)
+            g.cameraId = newId
+            g.lastSeen = {}
+            g.aliases = { Low = "", Medium = "", High = "" }
             if g.cameraId ~= "" then fetchAliases() end
         end
     elseif name == "RTSP Alias - Low" then
@@ -1809,6 +2334,9 @@ function OnPropertyChanged(name)
         end
     elseif name == "Preferred Quality" then
         g.preferred = v
+    elseif name == "Event Source" then
+        g.eventSource = v
+        if not g.initializing then wsRestart() end
     elseif name == "Event Polling Interval" then
         g.pollInterval = POLL_MS[v] or 0
         if not g.initializing then startPolling() end
@@ -1825,6 +2353,24 @@ function OnPropertyChanged(name)
         g.detect.animal = (v == "Yes")
     elseif name == "Detect Package" then
         g.detect.package = (v == "Yes")
+    elseif name == "Detect Motion" then
+        g.detect.motion = (v == "Yes")
+    elseif name == "Detect Doorbell" then
+        g.detect.doorbell = (v == "Yes")
+    elseif name == "History - Person" then
+        g.history.person = (v == "Yes")
+    elseif name == "History - Vehicle" then
+        g.history.vehicle = (v == "Yes")
+    elseif name == "History - Animal" then
+        g.history.animal = (v == "Yes")
+    elseif name == "History - Package" then
+        g.history.package = (v == "Yes")
+    elseif name == "History - Motion" then
+        g.history.motion = (v == "Yes")
+    elseif name == "History - Doorbell" then
+        g.history.doorbell = (v == "Yes")
+    elseif name == "History Cooldown" then
+        g.historyCooldown = tonumber(v) or 60
     elseif name == "Event Hold Time" then
         g.holdTime = tonumber(v) or 5
     elseif name == "Log Mode" then
@@ -1840,10 +2386,6 @@ function OnPropertyChanged(name)
                 log(LVL.INFO, "Debug logging auto-disabled after 8 hours")
             end)
         end
-    end
-
-    if name == "NVR Address" or name == "API Key" or name == "Camera" or name == "Camera ID" then
-        ensurePolling()
     end
 
     -- Stream URLs may have changed; tell navigators to drop cached ones.
@@ -1867,10 +2409,6 @@ function OnDriverInit()
 end
 
 function OnDriverLateInit()
-    -- Without a seed every driver instance draws the same "random" numbers, so
-    -- the jitter below would line all cameras up instead of spreading them.
-    pcall(function() math.randomseed(os.time() + C4:GetDeviceID() * 7919) end)
-
     -- Explicit order: logging first so startup is visible, then connection
     -- settings, then the camera, then its aliases. pairs() order is undefined
     -- and a bad order silently discards stored aliases.
@@ -1881,8 +2419,11 @@ function OnDriverLateInit()
         "RTSP Alias - Low", "RTSP Alias - Medium", "RTSP Alias - High",
         "RTSP Port", "Enable RTSP Automatically", "Preferred Quality", "Snapshots", "Controller Address",
         "Detect Person", "Detect Vehicle", "Detect Animal", "Detect Package",
+        "Detect Motion", "Detect Doorbell",
+        "History - Person", "History - Vehicle", "History - Animal", "History - Package",
+        "History - Motion", "History - Doorbell", "History Cooldown",
         "Event Hold Time",
-        "Event Polling Interval", "Adaptive Polling", "Adaptive Burst",
+        "Event Source", "Event Polling Interval", "Adaptive Polling", "Adaptive Burst",
     }
 
     g.initializing = true
@@ -1912,40 +2453,62 @@ function OnDriverLateInit()
     pushPortsToProxy()
     C4:SetTimer(5000,  function() pushPortsToProxy() end)
     C4:SetTimer(30000, function() pushPortsToProxy() end)
-    if g.address ~= "" then pushAddressToProxy() end
-    startSnapshotServer()
-
-    -- Every camera driver on the controller loads at the same instant, and
-    -- eight of them each asking the console twice at once is what tripped its
-    -- rate limit. Spread the requests over a few seconds, one kind per timer.
     if g.address ~= "" then
-        -- Repopulate the dropdown; the list itself does not persist across restarts.
-        C4:SetTimer(math.random(250, 4000), function() discoverCameras(true) end)
+        pushAddressToProxy()
     end
-    if g.cameraId ~= "" then
-        C4:SetTimer(math.random(4500, 9000), function()
-            if haveAlias then
-                -- Stored tokens may be stale if Protect rotated them.
-                fetchAliases(true)
-            else
-                log(LVL.INFO, "No stored aliases - fetching from Protect")
-                fetchAliases()
-            end
-        end)
-    elseif g.address ~= "" and g.apiKey ~= "" then
-        C4:SetTimer(math.random(250, 4000), function() testConnection() end)
+    -- The dropdown's list does not survive a restart. Fetching the whole camera
+    -- list from Protect here - in every camera driver, on every boot - just to
+    -- refill it was the biggest single source of startup load. Show the
+    -- current camera instead; Discover Cameras fetches the full list on demand.
+    local name = Properties["Camera Name"]
+    g.cameraName = name or ""
+    if g.cameraId ~= "" and name and name ~= "" then
+        g.cameraMap[name] = g.cameraId
+        C4:UpdatePropertyList("Camera", name, name)
     end
-    -- Polling needs no aliases; start it whenever address, key and camera are known.
-    if g.pollInterval == 0 then
-        startPolling()      -- records "polling off" in API Call Rate
-    else
-        ensurePolling()
-    end
+    startSnapshotServer()
+    registerHistoryEvents()
+    startPolling()   -- a no-op unless an interval is set
+    computeStatus()
+
+    -- Everything that talks to Protect is spread out. After a Director restart
+    -- every camera driver starts at once; without this, eight cameras each fire
+    -- their requests in the same instant - the pattern that tripped HTTP 429.
+    -- Each camera picks its own random slot in the first few seconds, and does
+    -- its own work in sequence: socket, then streams if missing, then version.
+    local slot = math.random(500, 8000)
+    C4:SetTimer(slot, function()
+        wsRestart()
+        -- Renaming refreshes the whole project, so each camera does it in its
+        -- own slot rather than all eight at the instant Director starts.
+        if g.cameraName ~= "" then
+            syncDeviceName(false)
+        elseif g.cameraId ~= "" and g.address ~= "" and g.apiKey ~= "" then
+            -- Cameras configured by hand before v49 never recorded their
+            -- name, so there was nothing to rename to. One request, once.
+            request("GET", basePath() .. "/cameras/" .. g.cameraId, nil, function(ok, data)
+                if ok and type(data) == "table" and data.name and data.name ~= "" then
+                    g.cameraName = tostring(data.name)
+                    C4:UpdateProperty("Camera Name", g.cameraName)
+                    syncDeviceName(false)
+                end
+            end, true)
+        end
+    end)
+    C4:SetTimer(slot + 2500, function()
+        if g.cameraId ~= "" and not (g.aliases.Low ~= "" or g.aliases.Medium ~= ""
+                                     or g.aliases.High ~= "") then
+            log(LVL.INFO, "No stored aliases - fetching from Protect")
+            fetchAliases()                 -- follows with the version check itself
+        elseif g.address ~= "" and g.apiKey ~= "" then
+            testConnection()
+        end
+    end)
 end
 
 function OnDriverDestroyed()
+    pcall(function() wsClose(false) end)
     if g.pollTimer then g.pollTimer:Cancel() end
-    if g.pollWatch then g.pollWatch:Cancel() end
     if g.reaperTimer then g.reaperTimer:Cancel() end
     if g.serverPort then C4:DestroyServer(g.serverPort) end
     g.snapData = nil

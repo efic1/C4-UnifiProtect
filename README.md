@@ -20,6 +20,8 @@ Built and tested against a live system: Control4 OS 3.4.3, UniFi Protect 6.x, G5
 | Live video on the LAN | Verified |
 | Live video remotely over 4Sight, no port forwarding | Verified |
 | Detection events in Composer programming | Verified |
+| Instant events over Protect's WebSocket stream | Verified |
+| Event timeline in the Control4 app (History) | Verified |
 | Setup driver creating and configuring cameras | Verified |
 | Snapshot thumbnails | Implemented and tested offline; not yet confirmed on hardware |
 | Audio | Not supported — see [Limitations](#limitations) |
@@ -74,8 +76,10 @@ it on. Otherwise run **Enable RTSP Streams** on the camera driver.
   not send headers. So each camera driver fetches frames itself with the key as a header, caches the
   latest, and serves it from a small HTTP listener on the controller. The key never leaves the
   controller. Frames are fetched only when a Navigator asks, and released after two minutes idle.
-- **Events** are polled, because DriverWorks has no WebSocket client. Polling is **off by default**.
-  With **Adaptive Polling**, a slow baseline speeds up to once a second for a burst after any event.
+- **Events** arrive over Protect's WebSocket event stream (`/v1/subscribe/events`): each detection
+  is pushed as it happens, with its real end time, over one persistent connection and no polling.
+  DriverWorks has no WebSocket API, so the driver implements RFC 6455 itself on top of a DriverWorks
+  TLS network connection. Polling is kept as a fallback and as an alternative.
 
 The in-driver documentation (Composer's Documentation tab) covers properties, actions and
 troubleshooting in detail. [docs/DEVELOPMENT_NOTES.md](docs/DEVELOPMENT_NOTES.md) records what was
@@ -84,12 +88,34 @@ documentation.
 
 ## Events
 
+Choose which detections fire events with **Detect Person / Vehicle / Animal / Package / Motion /
+Doorbell**, and separately which are recorded in the Control4 app's History timeline with **History
+- Person** and so on, plus a per-type cooldown. Set them once on the setup driver and they are
+pushed to every camera.
+
+Each History entry names its camera in the title — "Person Detected · Street North - G6" — or the
+name you gave the camera in Composer, if you did. The Composer device itself is also named after the
+Protect camera unless you named it.
+
 Motion Detected, Motion Ended, Person Detected, Vehicle Detected, Animal Detected, Package Detected,
 Doorbell Pressed, Camera Online, Camera Offline — with matching boolean variables for conditionals.
 
 Smart detections fire only when Protect names the detection class. If a detection arrives with no
 class, the driver logs a warning rather than guessing, since guessing "person" would fire false
 alarms for passing cars.
+
+## Load
+
+Built to add as little as possible to Protect and to Director:
+
+- One idle WebSocket per camera in normal running and **no periodic requests**; a steady stream of
+  events costs Protect nothing further.
+- After a Director restart each camera picks a random slot in the first few seconds, so eight
+  cameras do not call Protect at once. The camera list is fetched only on demand.
+- Polling, if enabled, slows to once a minute while the stream is live and never duplicates events.
+- Each driver discards other cameras' events with a substring check before parsing; frame parsing is
+  linear in the size of a burst; History writes are rate-limited.
+- **Run Diagnostics** reports request and message counts since startup.
 
 ## Limitations
 
@@ -98,7 +124,8 @@ alarms for passing cars.
   audio is believed to be AAC. To check your cameras, open a stream URL in VLC and look at Tools →
   Codec Information.
 - **No PTZ, no two-way talk, no recorded playback.**
-- **Detection latency follows the polling interval.** There is no push event channel.
+- **Face, licence-plate and smart audio detections**, and UniFi sensor events, reach the driver but
+  are not yet exposed as Control4 events.
 - **Snapshot thumbnails may not load away from home**, since the snapshot URL is a LAN address. Live
   video is unaffected.
 - The snapshot URL is unauthenticated and reachable from anything on the LAN. The API key is not.
@@ -138,7 +165,7 @@ once shipped broken:
 - Every event has a unique id and a description; no empty `<states/>`
 - The setup driver targets the camera driver's actual filename
 
-**Tests.** 92 tests across both drivers, each tied to a bug that shipped. The stub supports
+**Tests.** 172 tests across both drivers, each tied to a bug that shipped. The stub supports
 **asynchronous HTTP** (`async = true`, replies delivered on `st.flush()`), because the synchronous
 default hid a race that only appeared on real hardware. The setup driver's end-to-end tests load
 real camera driver instances in isolated environments and route `C4:SendToDevice` between them.

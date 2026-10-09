@@ -125,9 +125,20 @@ frames are arriving. <b>Controller Address</b> can stay blank unless auto-detect
 </ul>
 
 <h2>Events</h2>
-<p>Detection events are polled, because DriverWorks has no WebSocket client. <b>Event Polling
-Interval</b> is <b>Off</b> by default &mdash; no periodic API calls are made until you choose an
-interval.</p>
+<p>By default (<b>Event Source</b> = <i>WebSocket</i>) the driver keeps one connection open to
+Protect's event stream. Protect pushes each detection the moment it happens, together with its real
+end time, so events arrive within a second and <b>Motion Ended</b> reflects when motion actually
+stopped. No periodic requests are made. <b>Event Stream</b> shows the connection state.</p>
+<ul>
+  <li>If the connection drops, the driver reconnects on its own with increasing delays, capped at two
+      minutes. A connection that goes silent for about a minute and a half is replaced.</li>
+  <li>If the API key is refused, it waits five minutes between attempts rather than being throttled.</li>
+  <li>While the stream is connected, polling (if enabled) only tracks whether the camera is online;
+      it never fires detections, so nothing is reported twice. If the stream is down, polling covers.</li>
+</ul>
+<p>Set <b>Event Source</b> to <i>Polling</i> to use the older method, or <i>Off</i> for no events.</p>
+
+<h3>Polling</h3>
 <table>
   <tr><th>Interval</th><th>Requests per hour, per camera</th></tr>
   <tr><td>1 second</td><td>3,600</td></tr>
@@ -136,10 +147,32 @@ interval.</p>
   <tr><td>60 seconds</td><td>60</td></tr>
 </table>
 <p>With <b>Adaptive Polling</b> on, any event triggers a burst of one-per-second polling for
-<b>Adaptive Burst</b> seconds before dropping back. A slow baseline then still tracks activity
-closely. <b>API Call Rate</b> shows the current figure.</p>
-<p>Detection state clears when Protect reports the event ending; <b>Event Hold Time</b> is a
-watchdog for when no end arrives.</p>
+<b>Adaptive Burst</b> seconds. Polled detections have no end time, so <b>Event Hold Time</b> decides
+when they clear.</p>
+
+<h3>Choosing which events</h3>
+<p><b>Detect Person / Vehicle / Animal / Package / Motion / Doorbell</b> decide which detections fire
+programming events and set variables. For person only, set the other five to No.</p>
+
+<h2>History</h2>
+<p>Events can be recorded in the Control4 app's History timeline. <b>History - Person</b>, <b>-
+Vehicle</b> and so on choose which, independently of the Detect settings: a vehicle can switch on
+the driveway lights without every passing car filling the timeline. Defaults record people,
+packages and the doorbell.</p>
+<ul>
+  <li><b>History Cooldown</b> (default 60 seconds) stops the same type being recorded again for this
+      camera within that time, so a flickering detection writes one record, not dozens.</li>
+  <li>Each History entry names its camera in the title &mdash; "Person Detected &middot; Street North -
+      G6". (History ignores device names, so the name has to be in the entry itself.) If you have
+      given the camera your own name in Composer, that name is used instead.</li>
+  <li>The camera device in Composer is also named after the Protect camera, unless you named it
+      yourself. To switch back to the Protect name, run <b>Use Protect Camera Name</b>. Renaming
+      refreshes the project, so it happens only when the name actually changes. To switch back to the Protect name, run <b>Use
+      Protect Camera Name</b>. Renaming refreshes the project, so it happens only when the name
+      actually changes.</li>
+  <li>The <b>History</b> agent must be in the project. The driver registers its event types with it
+      at startup, retrying every 30 seconds while the agent starts up.</li>
+</ul>
 
 <h3>Programming events</h3>
 <p>Motion Detected, Motion Ended, Person Detected, Vehicle Detected, Animal Detected,
@@ -148,6 +181,20 @@ Package Detected, Doorbell Pressed, Camera Online, Camera Offline.</p>
 <code>VEHICLE_DETECTED</code>, <code>ANIMAL_DETECTED</code>, <code>PACKAGE_DETECTED</code>,
 <code>DOORBELL_RING</code>.</p>
 
+<h2>Load</h2>
+<p>Designed to add as little as possible to either Protect or Director.</p>
+<ul>
+  <li><b>Protect:</b> one idle connection per camera in normal running, and no periodic requests.
+      Events cost nothing extra. After a Director restart each camera waits a random few seconds
+      before connecting, so eight cameras do not all call Protect in the same instant. The camera
+      list is fetched only when you run Discover Cameras.</li>
+  <li><b>Director:</b> every camera's events arrive on every camera's connection, so each driver
+      discards other cameras' events with a cheap text check before parsing anything. History
+      writes are limited by the cooldown. Snapshots are fetched only when viewed and released when
+      idle.</li>
+  <li><b>Run Diagnostics</b> prints request and message counts since startup, so you can see it.</li>
+</ul>
+
 <h2>Actions</h2>
 <table>
   <tr><th>Action</th><th>What it does</th></tr>
@@ -155,6 +202,7 @@ Package Detected, Doorbell Pressed, Camera Online, Camera Offline.</p>
   <tr><td>Discover Cameras</td><td>Lists cameras and fills the Camera dropdown.</td></tr>
   <tr><td>Fetch Stream Aliases</td><td>Re-reads the stream tokens for this camera.</td></tr>
   <tr><td>Enable RTSP Streams</td><td>Asks Protect to turn RTSP on for all three qualities.</td></tr>
+  <tr><td>Use Protect Camera Name</td><td>Renames this device to the camera's Protect name, replacing a name you gave it.</td></tr>
   <tr><td>Run Diagnostics</td><td>Tests snapshot auth both ways, checks tokens are current, reports port problems.</td></tr>
   <tr><td>Show Stream URLs</td><td>Prints what the driver hands the proxy.</td></tr>
   <tr><td>Simulate Motion / Person / Doorbell</td><td>Fires an event for testing programming.</td></tr>
@@ -170,7 +218,8 @@ Package Detected, Doorbell Pressed, Camera Online, Camera Offline.</p>
   <tr><td>"Fetching streams..." never clears</td><td>The console is not answering. Run Test Connection.</td></tr>
   <tr><td>Only one quality offered</td><td>Only one channel has RTSP enabled. Run Enable RTSP Streams, then Fetch Stream Aliases.</td></tr>
   <tr><td>Auth Failed</td><td>Bad or revoked API key. Run Test Connection after correcting it.</td></tr>
-  <tr><td>Events never fire</td><td>Event Polling Interval is Off by default.</td></tr>
+  <tr><td>Events never fire</td><td>Check Event Stream says Connected. If it says Auth failed, the API key was refused.</td></tr>
+  <tr><td>Event Stream stays on Connecting</td><td>The controller cannot reach the console on port 443.</td></tr>
 </table>
 <p>For anything else, set <b>Log Mode</b> to <i>Print</i> and <b>Log Level</b> to <i>4 - Debug</i>,
 then reproduce the problem and read the Lua tab. Debug logging disables itself after 8 hours.</p>
@@ -179,7 +228,8 @@ then reproduce the problem and read the Lua tab. Debug logging disables itself a
 <ul>
   <li><b>No audio.</b> Protect sends AAC; Control4 accepts G.711 &micro;-law only.</li>
   <li><b>No PTZ</b>, no presets, no two-way talk, no recorded playback.</li>
-  <li>Detection latency matches the polling interval.</li>
+  <li>Face and licence-plate detections, smart audio detections, and events from UniFi sensors are
+      received but not yet exposed as Control4 events. Unrecognised types are logged.</li>
   <li>Smart detections fire only when Protect names a detection class. If detections arrive with
       no class list the driver logs a warning rather than guessing, since guessing would fire
       false person events.</li>

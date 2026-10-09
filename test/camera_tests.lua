@@ -798,6 +798,896 @@ test("Driver Status has exactly one writer", function()
 end)
 
 --=============================================================================
+print("\nEvent stream (WebSocket)")
+--=============================================================================
+-- A fake Protect server: builds real RFC 6455 frames and decodes the driver's.
+
+local function sframe(opcode, payload, fin)
+    payload = payload or ""
+    local b1 = (fin == false and 0 or 128) + opcode
+    local len = #payload
+    if len < 126 then return string.char(b1, len) .. payload end
+    if len < 65536 then
+        return string.char(b1, 126, math.floor(len / 256), len % 256) .. payload
+    end
+    local hdr = string.char(b1, 127)
+    local bytes = {}
+    local n = len
+    for i = 8, 1, -1 do bytes[i] = n % 256; n = math.floor(n / 256) end
+    for i = 1, 8 do hdr = hdr .. string.char(bytes[i]) end
+    return hdr .. payload
+end
+
+local function xorb(a, b)
+    local r, bit = 0, 1
+    while a > 0 or b > 0 do
+        local x, y = a % 2, b % 2
+        if x ~= y then r = r + bit end
+        a, b, bit = (a - x) / 2, (b - y) / 2, bit * 2
+    end
+    return r
+end
+
+-- Decodes one client frame: returns opcode, payload, masked.
+local function cframe(data)
+    local b1, b2 = data:byte(1, 2)
+    local masked, len, pos = b2 >= 128, b2 % 128, 3
+    if len == 126 then len = data:byte(3) * 256 + data:byte(4); pos = 5 end
+    local key = data:sub(pos, pos + 3); pos = pos + 4
+    local out = {}
+    for i = 1, len do
+        out[i] = string.char(xorb(data:byte(pos + i - 1), key:byte((i - 1) % 4 + 1)))
+    end
+    return b1 % 16, table.concat(out), masked
+end
+
+local HANDSHAKE_OK = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n" ..
+                     "Connection: Upgrade\r\nSec-WebSocket-Accept: x\r\n\r\n"
+
+local function evt(kind, extra)
+    local t = { '"id":"' .. (extra and extra.id or "E1") .. '"', '"modelKey":"event"',
+                '"type":"' .. kind .. '"', '"start":1700000000000',
+                '"device":"' .. (extra and extra.device or "CAM1") .. '"' }
+    if extra and extra["end"] then table.insert(t, '"end":1700000009000') end
+    if extra and extra.types then
+        table.insert(t, '"smartDetectTypes":["' .. table.concat(extra.types, '","') .. '"]')
+    end
+    return '{"type":"' .. (extra and extra.msg or "add") .. '","item":{' .. table.concat(t, ",") .. '}}'
+end
+
+-- A configured camera with the socket open and handshake complete.
+local function liveSocket()
+    local st = configured()
+    OnConnectionStatusChanged(6001, 443, "ONLINE")
+    ReceivedFromNetwork(6001, 443, HANDSHAKE_OK)
+    return st
+end
+local function push(st, text) ReceivedFromNetwork(6001, 443, sframe(1, text)) end
+
+test("connects over TLS to port 443 without certificate verification", function()
+    local st = configured()
+    local c = st.net.created[#st.net.created]
+    truthy(c, "a network connection must be created")
+    eq(c.binding, 6001, "binding in the network range")
+    eq(c.type, "SSL", "TLS")
+    eq(c.address, "192.0.2.10", "console address")
+    local o = st.net.options[#st.net.options]
+    eq(o.port, 443, "port")
+    eq(o.opts.VERIFY_MODE, "none", "self-signed certificate accepted")
+    eq(o.opts.KEEP_CONNECTION, false, "reconnects are the driver's, with backoff")
+end)
+
+test("the upgrade request is well-formed and carries the API key", function()
+    local st = configured()
+    OnConnectionStatusChanged(6001, 443, "ONLINE")
+    local req = st.netSent[#st.netSent].data
+    contains(req, "GET /proxy/protect/integration/v1/subscribe/events HTTP/1.1\r\n", "request line")
+    contains(req, "Upgrade: websocket\r\n", "upgrade")
+    contains(req, "Connection: Upgrade\r\n", "connection")
+    contains(req, "Sec-WebSocket-Version: 13\r\n", "version")
+    contains(req, "X-API-KEY: TESTKEY\r\n", "auth header")
+    local key = req:match("Sec%-WebSocket%-Key: ([^\r]+)")
+    truthy(key and #key == 24 and key:sub(-2) == "==", "16-byte base64 key, got " .. tostring(key))
+    truthy(req:sub(-4) == "\r\n\r\n", "headers terminated")
+end)
+
+test("a 101 response opens the stream", function()
+    local st = liveSocket()
+    eq(st.props["Event Stream"], "Connected", "stream state")
+end)
+
+test("a refused key backs off hard instead of hammering", function()
+    local st = configured()
+    OnConnectionStatusChanged(6001, 443, "ONLINE")
+    ReceivedFromNetwork(6001, 443, "HTTP/1.1 401 Unauthorized\r\n\r\n")
+    contains(st.props["Event Stream"], "Auth failed", "state")
+    local longest = 0
+    for _, tm in ipairs(st.timers) do if not tm.cancelled then longest = math.max(longest, tm.ms) end end
+    truthy(longest >= 60000, "retry at least a minute out, got " .. longest)
+end)
+
+test("motion start and end arrive as a real event pair", function()
+    local st = liveSocket()
+    st.events = {}
+    push(st, evt("motion"))
+    eq(st.vars["MOTION_DETECTED"], "true", "motion on")
+    push(st, evt("motion", { msg = "update", ["end"] = true }))
+    eq(st.vars["MOTION_DETECTED"], "false", "motion off at Protect's end time")
+    eq(st.events[1], 1, "Motion Detected fired")
+    eq(st.events[2], 2, "Motion Ended fired")
+end)
+
+-- clearEvent used to leave its watchdog running, so a real end was followed
+-- by a second "Motion Ended" when the stale timer fired.
+test("a real end is not followed by a second Ended from the watchdog", function()
+    local st = liveSocket()
+    push(st, evt("motion"))
+    push(st, evt("motion", { msg = "update", ["end"] = true }))
+    st.events = {}
+    st.fireTimers()
+    for _, e in ipairs(st.events) do truthy(e ~= 2, "a second Motion Ended fired") end
+end)
+
+test("events for other cameras are ignored", function()
+    local st = liveSocket()
+    push(st, evt("motion", { device = "SOMEONE-ELSE" }))
+    truthy(st.vars["MOTION_DETECTED"] ~= "true", "must not fire for another camera")
+end)
+
+test("smart detections fire per class, once, as the class list grows", function()
+    local st = liveSocket()
+    st.events = {}
+    push(st, evt("smartDetectZone", { types = { "face" } }))
+    push(st, evt("smartDetectZone", { msg = "update", types = { "face", "person" } }))
+    push(st, evt("smartDetectZone", { msg = "update", types = { "face", "person", "vehicle" } }))
+    push(st, evt("smartDetectZone", { msg = "update", types = { "person", "vehicle" } }))
+    eq(st.vars["PERSON_DETECTED"], "true", "person")
+    eq(st.vars["VEHICLE_DETECTED"], "true", "vehicle")
+    local persons = 0
+    for _, e in ipairs(st.events) do if e == 3 then persons = persons + 1 end end
+    eq(persons, 1, "person fired exactly once")
+    push(st, evt("smartDetectZone", { msg = "update", ["end"] = true, types = { "person", "vehicle" } }))
+    eq(st.vars["PERSON_DETECTED"], "false", "person cleared at end")
+end)
+
+test("an unmapped class is logged once per detection, not per update", function()
+    local st = liveSocket()
+    st.set("Log Mode", "Print"); st.set("Log Level", "4 - Debug")
+    local lines, real = 0, print
+    print = function(msg) if tostring(msg):find("'face' not mapped") then lines = lines + 1 end end
+    push(st, evt("smartDetectZone", { types = { "face" } }))
+    for _ = 1, 5 do push(st, evt("smartDetectZone", { msg = "update", types = { "face", "person" } })) end
+    print = real
+    eq(lines, 1, "log lines for one detection")
+end)
+
+test("line and loiter detections are handled like zone detections", function()
+    local st = liveSocket()
+    push(st, evt("smartDetectLine", { id = "L1", types = { "vehicle" } }))
+    eq(st.vars["VEHICLE_DETECTED"], "true", "line crossing")
+    push(st, evt("smartDetectLoiterZone", { id = "L2", types = { "person" } }))
+    eq(st.vars["PERSON_DETECTED"], "true", "loitering")
+end)
+
+test("a disabled detection class does not fire", function()
+    local st = liveSocket()
+    st.set("Detect Animal", "No")
+    push(st, evt("smartDetectZone", { types = { "animal" } }))
+    truthy(st.vars["ANIMAL_DETECTED"] ~= "true", "animal is switched off")
+end)
+
+test("a ring fires once even when repeated", function()
+    local st = liveSocket()
+    st.events = {}
+    push(st, evt("ring", { id = "R1", ["end"] = true }))   -- rings carry start and end together
+    push(st, evt("ring", { id = "R1", ["end"] = true }))
+    local rings = 0
+    for _, e in ipairs(st.events) do if e == 7 then rings = rings + 1 end end
+    eq(rings, 1, "Doorbell Pressed fired once")
+end)
+
+test("a late update after an event ends does not restart it", function()
+    local st = liveSocket()
+    push(st, evt("motion", { id = "M9" }))
+    push(st, evt("motion", { id = "M9", msg = "update", ["end"] = true }))
+    push(st, evt("motion", { id = "M9", msg = "update" }))     -- stale, no end
+    eq(st.vars["MOTION_DETECTED"], "false", "stays off")
+end)
+
+-- Per-class dedupe alone would miss this: a stale update after the end that
+-- introduces a class not seen before.
+test("a late update cannot add a new class to an ended event", function()
+    local st = liveSocket()
+    push(st, evt("smartDetectZone", { id = "S9", types = { "person" } }))
+    push(st, evt("smartDetectZone", { id = "S9", msg = "update", ["end"] = true, types = { "person" } }))
+    push(st, evt("smartDetectZone", { id = "S9", msg = "update", types = { "person", "vehicle" } }))
+    truthy(st.vars["VEHICLE_DETECTED"] ~= "true", "vehicle fired after the event ended")
+end)
+
+test("separate rings each fire", function()
+    local st = liveSocket()
+    st.events = {}
+    push(st, evt("ring", { id = "R1", ["end"] = true }))
+    push(st, evt("ring", { id = "R2", ["end"] = true }))
+    local rings = 0
+    for _, e in ipairs(st.events) do if e == 7 then rings = rings + 1 end end
+    eq(rings, 2, "two presses, two events")
+end)
+
+test("a frame split across reads is reassembled", function()
+    local st = liveSocket()
+    local f = sframe(1, evt("motion"))
+    for i = 1, #f do ReceivedFromNetwork(6001, 443, f:sub(i, i)) end   -- one byte at a time
+    eq(st.vars["MOTION_DETECTED"], "true", "byte-at-a-time delivery")
+end)
+
+test("the handshake and the first event can arrive together", function()
+    local st = configured()
+    OnConnectionStatusChanged(6001, 443, "ONLINE")
+    ReceivedFromNetwork(6001, 443, HANDSHAKE_OK .. sframe(1, evt("motion")))
+    eq(st.vars["MOTION_DETECTED"], "true", "event in the handshake packet")
+end)
+
+test("several frames in one read are all processed", function()
+    local st = liveSocket()
+    ReceivedFromNetwork(6001, 443, sframe(1, evt("motion", { id = "A" })) ..
+        sframe(1, evt("smartDetectZone", { id = "B", types = { "person" } })))
+    eq(st.vars["MOTION_DETECTED"], "true", "first frame")
+    eq(st.vars["PERSON_DETECTED"], "true", "second frame")
+end)
+
+test("a message over 125 bytes uses the extended length", function()
+    local st = liveSocket()
+    local msg = evt("motion"):gsub('}}$', ',"padding":"' .. string.rep("x", 300) .. '"}}')
+    push(st, msg)
+    eq(st.vars["MOTION_DETECTED"], "true", "16-bit length frame")
+end)
+
+test("a fragmented message is reassembled", function()
+    local st = liveSocket()
+    local m = evt("motion")
+    ReceivedFromNetwork(6001, 443, sframe(1, m:sub(1, 20), false) ..
+        sframe(0, m:sub(21, 40), false) .. sframe(0, m:sub(41), true))
+    eq(st.vars["MOTION_DETECTED"], "true", "continuation frames")
+end)
+
+test("a ping is answered with a masked pong carrying the same data", function()
+    local st = liveSocket()
+    local before = #st.netSent
+    ReceivedFromNetwork(6001, 443, sframe(9, "keepalive"))
+    truthy(#st.netSent > before, "a reply must be sent")
+    local op, payload, masked = cframe(st.netSent[#st.netSent].data)
+    eq(op, 10, "pong opcode")
+    eq(payload, "keepalive", "echoed payload")
+    truthy(masked, "client frames must be masked")
+end)
+
+test("a server close leads to a scheduled reconnect", function()
+    local st = liveSocket()
+    ReceivedFromNetwork(6001, 443, sframe(8, ""))
+    contains(st.props["Event Stream"], "Reconnecting", "state")
+    local connects = st.net.connects
+    st.fireTimers()
+    truthy(st.net.connects > connects, "a new connection attempt follows")
+end)
+
+test("reconnect delays back off", function()
+    local st = liveSocket()
+    local delays = {}
+    for _ = 1, 4 do
+        st.timers = {}
+        OnConnectionStatusChanged(6001, 443, "OFFLINE")
+        for _, tm in ipairs(st.timers) do if tm.ms >= 1000 then table.insert(delays, tm.ms) end end
+        st.fireTimers()                              -- reconnect attempt
+        OnConnectionStatusChanged(6001, 443, "ONLINE")
+    end
+    truthy(#delays >= 4, "a delay per drop")
+    truthy(delays[4] > delays[1], "later delays are longer: " .. table.concat(delays, ","))
+end)
+
+test("a malformed message does not break the stream", function()
+    local st = liveSocket()
+    push(st, "{not json")
+    push(st, evt("motion"))
+    eq(st.vars["MOTION_DETECTED"], "true", "next message still handled")
+    eq(st.props["Event Stream"], "Connected", "still connected")
+end)
+
+test("an unknown event type is reported, not fatal", function()
+    local st = liveSocket()
+    push(st, evt("sensorWaterLeak"))
+    push(st, evt("motion", { id = "M2" }))
+    eq(st.vars["MOTION_DETECTED"], "true", "stream continues")
+end)
+
+-- While the socket delivers events, polling must not fire them too.
+test("polling does not double events while the socket is live", function()
+    local st = liveSocket()
+    st.set("Event Polling Interval", "5 Seconds")
+    st.routes["/cameras/CAM1$"] = { body = '{"id":"CAM1","state":"CONNECTED","lastMotion":100}' }
+    st.fireTimers(function(tm) return tm.ms == 5000 end)          -- first poll: baseline
+    st.routes["/cameras/CAM1$"] = { body = '{"id":"CAM1","state":"CONNECTED","lastMotion":200}' }
+    st.events = {}
+    st.fireTimers(function(tm) return tm.ms == 5000 end)          -- second poll: advanced
+    for _, e in ipairs(st.events) do truthy(e ~= 1, "polling fired motion while socket live") end
+end)
+
+test("Event Source Off opens no connection", function()
+    local st = stub.new()
+    st.load(CAM .. "driver.lua")
+    st.set("Log Mode", "Off")
+    st.set("Event Source", "Off")
+    st.set("NVR Address", "192.0.2.10")
+    st.set("API Key", "K")
+    eq(#st.net.created, 0, "no socket")
+    eq(st.props["Event Stream"], "Off", "state")
+end)
+
+test("a silent connection is detected and replaced", function()
+    local st = liveSocket()
+    local connects = st.net.connects
+    local real = os.time
+    os.time = function() return real() + 200 end        -- nothing received for 200s
+    st.fireTimers(function(tm) return tm.repeating end)  -- ping watchdog
+    os.time = real
+    contains(st.props["Event Stream"], "Reconnecting", "dead link noticed")
+end)
+
+-- Structural guard, matching the Driver Status rule.
+test("Event Stream has exactly one writer", function()
+    local src = io.open(CAM .. "driver.lua"):read("*a")
+    local n = select(2, src:gsub('UpdateProperty%("Event Stream"', ""))
+    eq(n, 1, "writers of Event Stream")
+end)
+
+--=============================================================================
+print("\nEvent filtering")
+--=============================================================================
+
+test("Detect Motion off suppresses motion events", function()
+    local st = liveSocket()
+    st.set("Detect Motion", "No")
+    st.events = {}
+    push(st, evt("motion"))
+    truthy(st.vars["MOTION_DETECTED"] ~= "true", "variable must not be set")
+    for _, e in ipairs(st.events) do truthy(e ~= 1, "Motion Detected fired") end
+end)
+
+test("Detect Doorbell off suppresses rings", function()
+    local st = liveSocket()
+    st.set("Detect Doorbell", "No")
+    st.events = {}
+    push(st, evt("ring", { ["end"] = true }))
+    for _, e in ipairs(st.events) do truthy(e ~= 7, "Doorbell Pressed fired") end
+end)
+
+test("person only: other classes are dropped", function()
+    local st = liveSocket()
+    st.set("Detect Vehicle", "No")
+    st.set("Detect Animal", "No")
+    st.set("Detect Package", "No")
+    push(st, evt("smartDetectZone", { types = { "person", "vehicle", "animal", "package" } }))
+    eq(st.vars["PERSON_DETECTED"], "true", "person")
+    truthy(st.vars["VEHICLE_DETECTED"] ~= "true", "vehicle dropped")
+    truthy(st.vars["PACKAGE_DETECTED"] ~= "true", "package dropped")
+end)
+
+--=============================================================================
+print("\nHistory")
+--=============================================================================
+
+local function histLabels(st)
+    local out = {}
+    for _, h in ipairs(st.history) do table.insert(out, h[2]) end
+    return out
+end
+
+test("a person detection is recorded in History", function()
+    local st = liveSocket()
+    push(st, evt("smartDetectZone", { types = { "person" } }))
+    eq(#st.history, 1, "records")
+    local h = st.history[1]
+    eq(h[1], "Info", "severity")
+    eq(h[2], "Person Detected", "type")
+    eq(h[3], "Cameras", "category")
+    eq(h[4], "UniFi Protect", "subcategory")
+end)
+
+-- The metadata argument stopped records being stored on OS 3.4.3.
+test("History is written with exactly four arguments", function()
+    local st = liveSocket()
+    push(st, evt("smartDetectZone", { types = { "person" } }))
+    eq(st.history[1].n, 4, "argument count")
+end)
+
+test("History selection is independent of programming events", function()
+    local st = liveSocket()              -- History - Vehicle defaults to No
+    push(st, evt("smartDetectZone", { types = { "vehicle" } }))
+    eq(st.vars["VEHICLE_DETECTED"], "true", "vehicle still drives programming")
+    eq(#st.history, 0, "but is not recorded")
+end)
+
+test("only person in History", function()
+    local st = liveSocket()
+    for _, k in ipairs({ "Vehicle", "Animal", "Package", "Motion", "Doorbell" }) do
+        st.set("History - " .. k, "No")
+    end
+    st.set("History - Person", "Yes")
+    st.set("Detect Animal", "Yes"); st.set("Detect Package", "Yes")
+    push(st, evt("motion", { id = "a" }))
+    push(st, evt("ring", { id = "b", ["end"] = true }))
+    push(st, evt("smartDetectZone", { id = "c", types = { "vehicle", "animal", "package", "person" } }))
+    local labels = histLabels(st)
+    eq(#labels, 1, "one record: " .. table.concat(labels, ","))
+    eq(labels[1], "Person Detected", "the person")
+end)
+
+test("the cooldown holds back repeats, then lets one through", function()
+    local st = liveSocket()
+    local real, now = os.time, os.time()
+    os.time = function() return now end
+    push(st, evt("smartDetectZone", { id = "p1", types = { "person" } }))
+    push(st, evt("smartDetectZone", { id = "p1", msg = "update", ["end"] = true, types = { "person" } }))
+    now = now + 20
+    push(st, evt("smartDetectZone", { id = "p2", types = { "person" } }))
+    push(st, evt("smartDetectZone", { id = "p2", msg = "update", ["end"] = true, types = { "person" } }))
+    eq(#st.history, 1, "second person within 60s held back")
+    now = now + 61
+    push(st, evt("smartDetectZone", { id = "p3", types = { "person" } }))
+    os.time = real
+    eq(#st.history, 2, "recorded again after the cooldown")
+    eq(GetDriverStats().historySkipped, 1, "the hold-back is counted")
+end)
+
+test("a growing class list does not re-record the same detection", function()
+    local st = liveSocket()
+    push(st, evt("smartDetectZone", { types = { "person" } }))
+    push(st, evt("smartDetectZone", { msg = "update", types = { "person", "face" } }))
+    push(st, evt("smartDetectZone", { msg = "update", types = { "person", "face" } }))
+    eq(#st.history, 1, "one record for one detection")
+end)
+
+test("a detection switched off is not recorded either", function()
+    local st = liveSocket()
+    st.set("Detect Person", "No")
+    push(st, evt("smartDetectZone", { types = { "person" } }))
+    eq(#st.history, 0, "records")
+end)
+
+test("pushed History and Detect choices take effect, not just display", function()
+    local st = liveSocket()
+    ExecuteCommand("SET_PROTECT_CONFIG", {
+        history_vehicle = "Yes", history_person = "No", detect_motion = "No", history_cooldown = "0",
+    })
+    eq(st.props["History - Vehicle"], "Yes", "shown")
+    push(st, evt("smartDetectZone", { id = "v1", types = { "vehicle", "person" } }))
+    push(st, evt("motion", { id = "m1" }))
+    local labels = histLabels(st)
+    eq(#labels, 1, "records: " .. table.concat(labels, ","))
+    eq(labels[1], "Vehicle Detected", "vehicle recorded, person not")
+    truthy(st.vars["MOTION_DETECTED"] ~= "true", "motion switched off by the push")
+end)
+
+test("event types are registered on startup", function()
+    local st = configured()
+    OnDriverLateInit()
+    eq(#st.registered, 1, "one registration")
+    local xml = st.registered[1]
+    contains(xml, '<device id="901"/>', "the proxy device")
+    contains(xml, '<category name="Cameras">', "category")
+    contains(xml, '<subcategory name="UniFi Protect">', "subcategory")
+end)
+
+-- Records under an unregistered type land in the History agent but never
+-- appear in the Control4 app. Every type the driver can record must be listed.
+test("every type that can be recorded is registered", function()
+    local st = configured()
+    OnDriverLateInit()
+    local xml = st.registered[1]
+    for _, k in ipairs({ "Vehicle", "Animal", "Package", "Motion", "Doorbell" }) do
+        st.set("History - " .. k, "Yes")
+    end
+    st.set("History Cooldown", "0")
+    st.set("Detect Animal", "Yes"); st.set("Detect Package", "Yes")
+    OnConnectionStatusChanged(6001, 443, "ONLINE")
+    ReceivedFromNetwork(6001, 443, HANDSHAKE_OK)
+    push(st, evt("motion", { id = "1" }))
+    push(st, evt("ring", { id = "2", ["end"] = true }))
+    push(st, evt("smartDetectZone", { id = "3", types = { "person", "vehicle", "animal", "package" } }))
+    eq(#st.history, 6, "all six kinds recorded")
+    for _, h in ipairs(st.history) do
+        contains(xml, '<type name="' .. h[2] .. '"/>', "registered type")
+    end
+end)
+
+test("registration retries while the History agent is not ready", function()
+    local st = stub.new({ registerResult = false })
+    st.load(CAM .. "driver.lua")
+    st.set("Log Mode", "Off")
+    OnDriverLateInit()
+    local retry
+    for _, tm in ipairs(st.timers) do if tm.ms == 30000 and not tm.fired then retry = tm end end
+    truthy(retry, "a 30s retry is scheduled")
+    st.registerResult = true
+    retry.fn()
+    eq(#st.registered, 2, "second attempt made")
+end)
+
+test("registration gives up eventually", function()
+    local st = stub.new({ registerResult = false })
+    st.load(CAM .. "driver.lua")
+    st.set("Log Mode", "Off")
+    OnDriverLateInit()
+    for _ = 1, 40 do st.fireTimers(function(tm) return tm.ms == 30000 end) end
+    truthy(#st.registered <= 20, "bounded, got " .. #st.registered)
+end)
+
+test("a registration result of 0 counts as success", function()
+    local st = stub.new({ registerResult = 0 })
+    st.load(CAM .. "driver.lua")
+    st.set("Log Mode", "Off")
+    OnDriverLateInit()
+    st.fireTimers(function(tm) return tm.ms == 30000 end)
+    eq(#st.registered, 1, "no second attempt after success")
+end)
+
+--=============================================================================
+print("\nLoad on Protect and on Director")
+--=============================================================================
+
+-- Every camera driver used to fetch the whole camera list, test the
+-- connection and open its socket the instant Director started.
+test("startup sends nothing to Protect immediately", function()
+    local st = configured()
+    st.requests, st.net.connects = {}, 0
+    OnDriverLateInit()
+    eq(#st.requests, 0, "HTTP requests at the instant of startup")
+    eq(st.net.connects, 0, "socket connections at the instant of startup")
+end)
+
+test("startup never fetches the full camera list", function()
+    local st = configured()
+    st.requests = {}
+    OnDriverLateInit()
+    st.fireTimers()
+    for _, r in ipairs(st.requests) do
+        truthy(not r.url:find("/cameras$"), "fetched the camera list: " .. r.url)
+    end
+end)
+
+test("the current camera still shows in the dropdown after a restart", function()
+    local st = configured()
+    st.props["Camera Name"] = "Pool"
+    OnDriverLateInit()
+    eq(st.lists["Camera"], "Pool", "dropdown")
+end)
+
+test("each camera picks its own startup slot", function()
+    local slots = {}
+    for i = 1, 8 do
+        local st = configured()
+        st.timers = {}
+        OnDriverLateInit()
+        for _, tm in ipairs(st.timers) do
+            if tm.ms >= 500 and tm.ms <= 8000 and tm.ms ~= 5000 then slots[tm.ms] = true end
+        end
+    end
+    local n = 0
+    for _ in pairs(slots) do n = n + 1 end
+    truthy(n >= 4, "eight cameras should spread over several slots, got " .. n)
+end)
+
+test("while the socket is live, events do not trigger adaptive polling", function()
+    local st = liveSocket()
+    st.set("Event Polling Interval", "5 Seconds")
+    st.set("Adaptive Polling", "Yes")
+    push(st, evt("motion"))
+    st.timers = {}
+    st.set("Event Polling Interval", "5 Seconds")        -- reschedule
+    for _, tm in ipairs(st.timers) do
+        truthy(tm.ms ~= 1000, "a 1-second burst was scheduled")
+    end
+end)
+
+test("while the socket is live, polling slows to once a minute", function()
+    local st = liveSocket()
+    st.timers = {}
+    st.set("Event Polling Interval", "5 Seconds")
+    local poll
+    for _, tm in ipairs(st.timers) do if not tm.repeating then poll = tm end end
+    truthy(poll and poll.ms >= 60000, "poll delay " .. tostring(poll and poll.ms))
+end)
+
+test("a steady stream of events costs Protect nothing", function()
+    local st = liveSocket()
+    local before = GetDriverStats().apiRequests
+    for i = 1, 100 do
+        push(st, evt("smartDetectZone", { id = "e" .. i, types = { "person" } }))
+        push(st, evt("smartDetectZone", { id = "e" .. i, msg = "update", ["end"] = true, types = { "person" } }))
+    end
+    st.fireTimers()
+    eq(GetDriverStats().apiRequests - before, 0, "requests caused by 100 detections")
+end)
+
+test("other cameras' events are skipped without being parsed", function()
+    local st = liveSocket()
+    local s0 = GetDriverStats()
+    for i = 1, 7 do push(st, evt("motion", { id = "o" .. i, device = "OTHER" .. i })) end
+    push(st, evt("motion", { id = "mine" }))
+    local s1 = GetDriverStats()
+    eq(s1.wsIgnored - s0.wsIgnored, 7, "skipped")
+    eq(s1.wsDecoded - s0.wsDecoded, 1, "parsed")
+end)
+
+-- Parsing re-copied the remaining buffer after every frame, which is
+-- quadratic in the number of frames per read. Correct output either way, so
+-- only timing can tell. Measured: ~10 ms linear, ~700 ms quadratic, for
+-- 15,000 frames (just under the 1 MB buffer cap). Threshold leaves wide margin.
+test("parsing a large burst stays linear", function()
+    local st = liveSocket()
+    local f = string.char(129, 60) .. string.rep("x", 60)
+    local blob = string.rep(f, 15000)
+    local t0 = os.clock()
+    ReceivedFromNetwork(6001, 443, blob)
+    local took = os.clock() - t0
+    truthy(took < 0.25, string.format("15,000 frames took %.3fs", took))
+    eq(st.props["Event Stream"], "Connected", "still connected")
+end)
+
+-- The socket path dedupes per event, which hides this. With polling, a long
+-- motion keeps advancing lastMotion; with the cooldown at 0 every poll would
+-- write a History record.
+test("a detection still in progress is recorded once, not per poll", function()
+    local st = configured()
+    st.set("Event Source", "Polling")
+    st.set("History - Motion", "Yes")
+    st.set("History Cooldown", "0")
+    st.set("Event Hold Time", "60")
+    st.set("Adaptive Polling", "No")        -- keep every poll on the 5s timer
+    st.set("Event Polling Interval", "5 Seconds")
+    for ts = 100, 500, 100 do
+        st.routes["/cameras/CAM1$"] = { body = '{"id":"CAM1","state":"CONNECTED","lastMotion":' .. ts .. '}' }
+        st.fireTimers(function(tm) return tm.ms == 5000 end)
+    end
+    eq(GetDriverStats().apiRequests >= 5, true, "the polls actually ran")
+    eq(#st.history, 1, "records for one continuous motion")
+end)
+
+test("a burst of many frames in one read is handled", function()
+    local st = liveSocket()
+    local parts = {}
+    for i = 1, 200 do parts[i] = sframe(1, evt("motion", { id = "b" .. i, device = "X" })) end
+    parts[201] = sframe(1, evt("motion", { id = "last" }))
+    ReceivedFromNetwork(6001, 443, table.concat(parts))
+    eq(st.vars["MOTION_DETECTED"], "true", "the last frame of 201 was reached")
+    eq(GetDriverStats().wsMessages, 201, "all frames counted")
+end)
+
+--=============================================================================
+print("\nDevice name")
+--=============================================================================
+-- The Composer-visible (proxy) device is named after the camera. History is
+-- NOT: field-verified on OS 3.4.3, it labels records with the driver's
+-- definition name and ignores renaming either device. So History entries carry
+-- the camera name in their title instead (next section).
+
+local function named(opts)
+    local st = stub.new(opts or {})
+    st.load(CAM .. "driver.lua")
+    st.set("Log Mode", "Off")
+    return st
+end
+
+local DEFAULT_DRIVER_NAME = "UniFi Protect Camera (Standalone)"
+
+test("the Composer device takes the camera's name", function()
+    local st = named()
+    ExecuteCommand("SET_PROTECT_CONFIG", { camera_id = "C1", camera_name = "Front Door - G5" })
+    eq(st.displayNames[901], "Front Door - G5", "proxy (what Composer shows)")
+end)
+
+-- v50 renamed the driver device too. It changed nothing visible, and every
+-- rename refreshes the whole project on Director.
+test("the driver device is never renamed", function()
+    local st = named()
+    ExecuteCommand("SET_PROTECT_CONFIG", { camera_id = "C1", camera_name = "Front Door - G5" })
+    ExecuteCommand("LUA_ACTION", { ACTION = "UseCameraName" })
+    eq(st.displayNames[100], DEFAULT_DRIVER_NAME, "driver device untouched")
+    for _, r in ipairs(st.renamed) do truthy(r.id ~= 100, "renamed the driver device") end
+end)
+
+test("a name the installer chose is left alone", function()
+    local st = named({ displayNames = { [901] = "Front Porch", [100] = DEFAULT_DRIVER_NAME } })
+    ExecuteCommand("SET_PROTECT_CONFIG", { camera_id = "C1", camera_name = "Front Door - G5" })
+    eq(#st.renamed, 0, "renames")
+end)
+
+test("Use Protect Camera Name overrides the installer's name on request", function()
+    local st = named({ displayNames = { [901] = "Front Porch", [100] = DEFAULT_DRIVER_NAME } })
+    ExecuteCommand("SET_PROTECT_CONFIG", { camera_id = "C1", camera_name = "Front Door - G5" })
+    ExecuteCommand("LUA_ACTION", { ACTION = "UseCameraName" })
+    eq(st.displayNames[901], "Front Door - G5", "proxy")
+end)
+
+test("matching names cause no rename, so no project refresh", function()
+    local st = named({ displayNames = { [901] = "Pool", [100] = DEFAULT_DRIVER_NAME } })
+    ExecuteCommand("SET_PROTECT_CONFIG", { camera_id = "C1", camera_name = "Pool" })
+    ExecuteCommand("SET_PROTECT_CONFIG", { camera_id = "C1", camera_name = "Pool" })
+    eq(#st.renamed, 0, "renames")
+end)
+
+test("repeated pushes rename once", function()
+    local st = named()
+    for _ = 1, 5 do
+        ExecuteCommand("SET_PROTECT_CONFIG", { camera_id = "C1", camera_name = "Pool" })
+    end
+    eq(#st.renamed, 1, "renames")
+end)
+
+test("the name follows a rename in Protect", function()
+    local st = named()
+    ExecuteCommand("SET_PROTECT_CONFIG", { camera_id = "C1", camera_name = "Pool" })
+    ExecuteCommand("SET_PROTECT_CONFIG", { camera_id = "C1", camera_name = "Pool Deck" })
+    eq(st.displayNames[901], "Pool Deck", "followed")
+end)
+
+test("a numeric proxy id is used for rename and registration", function()
+    local st = named({ proxyId = 393, displayNames = { [393] = "UniFi Protect Camera", [100] = DEFAULT_DRIVER_NAME } })
+    ExecuteCommand("SET_PROTECT_CONFIG", { camera_id = "C1", camera_name = "Street North - G6" })
+    eq(st.displayNames[393], "Street North - G6", "proxy renamed")
+    OnDriverLateInit()
+    contains(st.registered[#st.registered] or "", '<device id="393"/>', "registered against the proxy")
+end)
+
+test("a proxy id returned as a string is understood", function()
+    local st = named({ proxyReturn = "393", displayNames = { [393] = "UniFi Protect Camera", [100] = DEFAULT_DRIVER_NAME } })
+    ExecuteCommand("SET_PROTECT_CONFIG", { camera_id = "C1", camera_name = "Pool" })
+    eq(st.displayNames[393], "Pool", "proxy renamed")
+end)
+
+test("a proxy id returned as a table is understood", function()
+    local st = named({ proxyReturn = { [393] = true }, displayNames = { [393] = "UniFi Protect Camera", [100] = DEFAULT_DRIVER_NAME } })
+    ExecuteCommand("SET_PROTECT_CONFIG", { camera_id = "C1", camera_name = "Pool" })
+    eq(st.displayNames[393], "Pool", "proxy renamed")
+end)
+
+test("a missing camera name is looked up once, then used", function()
+    local st = named({ routes = { ["/cameras/C1$"] = { body = '{"id":"C1","name":"Garden"}' } } })
+    st.props["NVR Address"] = "192.0.2.10"; st.props["API Key"] = "K"; st.props["Camera ID"] = "C1"
+    OnDriverLateInit()
+    st.requests = {}
+    st.fireTimers(function(tm) return tm.ms >= 500 and tm.ms <= 8000 and tm.ms ~= 5000 end)
+    local lookups = 0
+    for _, r in ipairs(st.requests) do if r.url:find("/cameras/C1$") then lookups = lookups + 1 end end
+    eq(lookups, 1, "one lookup")
+    eq(st.displayNames[901], "Garden", "Composer device named")
+end)
+
+test("no lookup when the name is already known", function()
+    local st = named({ routes = { ["/cameras/C1$"] = { body = '{"id":"C1","name":"Garden"}' } } })
+    st.props["NVR Address"] = "192.0.2.10"; st.props["API Key"] = "K"; st.props["Camera ID"] = "C1"
+    st.props["Camera Name"] = "Garden"
+    OnDriverLateInit()
+    st.requests = {}
+    st.fireTimers(function(tm) return tm.ms >= 500 and tm.ms <= 8000 and tm.ms ~= 5000 end)
+    for _, r in ipairs(st.requests) do truthy(not r.url:find("/cameras/C1$"), "needless lookup") end
+end)
+
+test("choosing a camera from the dropdown names the device", function()
+    local st = stub.new({ routes = {
+        ["/cameras$"] = { body = '[{"id":"C7","name":"Garage"}]' },
+        ["rtsps%-stream"] = { body = '{"low":"rtsps://h:7441/T?enableSrtp"}' },
+    } })
+    st.load(CAM .. "driver.lua")
+    st.set("Log Mode", "Off")
+    st.set("NVR Address", "192.0.2.10")
+    st.set("API Key", "K")
+    ExecuteCommand("LUA_ACTION", { ACTION = "DiscoverCameras" })
+    st.set("Camera", "Garage")
+    eq(st.displayNames[901], "Garage", "Composer device name")
+end)
+
+test("a rename seen by polling renames the device without error", function()
+    local st = named({ routes = {
+        ["/cameras/C1$"] = { body = '{"id":"C1","name":"Side Gate","state":"CONNECTED"}' } } })
+    st.set("NVR Address", "192.0.2.10"); st.set("API Key", "K"); st.set("Camera ID", "C1")
+    st.set("Event Source", "Polling")
+    st.set("Event Polling Interval", "5 Seconds")
+    st.fireTimers(function(tm) return tm.ms == 5000 end)
+    eq(st.displayNames[901], "Side Gate", "Composer device name")
+end)
+
+test("at startup the rename waits for the camera's own slot", function()
+    local st = named()
+    st.props["Camera Name"] = "Pool"
+    st.props["Camera ID"] = "C1"
+    OnDriverLateInit()
+    eq(#st.renamed, 0, "no rename at the instant of startup")
+    st.fireTimers(function(tm) return tm.ms >= 500 and tm.ms <= 8000 and tm.ms ~= 5000 end)
+    eq(#st.renamed, 1, "renamed in its slot")
+end)
+
+test("Diagnostics reports the proxy, not nil", function()
+    local st = named()
+    ExecuteCommand("SET_PROTECT_CONFIG", { camera_id = "C1", camera_name = "Pool" })
+    local out, real = {}, print
+    print = function(m) table.insert(out, tostring(m)) end
+    ExecuteCommand("LUA_ACTION", { ACTION = "Diagnostics" })
+    print = real
+    local line = ""
+    for _, l in ipairs(out) do if l:find("Names:") then line = l end end
+    contains(line, "proxy=901 'Pool'", "names line")
+end)
+
+--=============================================================================
+print("\nCamera name in History")
+--=============================================================================
+local DOT = "\194\183"   -- UTF-8 middle dot
+
+local function simulatedPerson(opts)
+    local st = named(opts)
+    ExecuteCommand("SET_PROTECT_CONFIG", { camera_id = "C1", camera_name = "Street North - G6" })
+    ExecuteCommand("LUA_ACTION", { ACTION = "SimulatePerson" })
+    return st
+end
+
+-- The field result that forced this design: renaming both devices left History
+-- showing "UniFi Protect Camera (Standalone)".
+test("a History entry names its camera", function()
+    local st = simulatedPerson()
+    eq(st.history[1][2], "Person Detected " .. DOT .. " Street North - G6", "entry title")
+end)
+
+test("an installer's name is used in History instead", function()
+    local st = simulatedPerson({ displayNames = { [901] = "Front Street", [100] = DEFAULT_DRIVER_NAME } })
+    eq(st.history[1][2], "Person Detected " .. DOT .. " Front Street", "entry title")
+end)
+
+test("with no name known, the plain title is used", function()
+    local st = named()
+    ExecuteCommand("LUA_ACTION", { ACTION = "SimulatePerson" })
+    eq(st.history[1][2], "Person Detected", "entry title")
+end)
+
+test("the camera's own titles are registered", function()
+    local st = simulatedPerson()
+    local xml = st.registered[#st.registered] or ""
+    contains(xml, '<type name="Person Detected ' .. DOT .. ' Street North - G6"/>', "registered title")
+    contains(xml, '<type name="Doorbell Pressed ' .. DOT .. ' Street North - G6"/>', "every kind")
+end)
+
+test("every title written has been registered", function()
+    local st = simulatedPerson()
+    local xml = st.registered[#st.registered] or ""
+    for _, h in ipairs(st.history) do contains(xml, '<type name="' .. h[2] .. '"/>', "registered") end
+end)
+
+test("a new camera name is registered again", function()
+    local st = simulatedPerson()
+    local before = #st.registered
+    st.set("History Cooldown", "0")
+    st.fireTimers()                                   -- let the first detection end
+    ExecuteCommand("SET_PROTECT_CONFIG", { camera_name = "Street North" })
+    ExecuteCommand("LUA_ACTION", { ACTION = "SimulatePerson" })
+    eq(#st.history, 2, "the second detection was recorded")
+    truthy(#st.registered > before, "re-registered")
+    contains(st.registered[#st.registered], DOT .. ' Street North"/>', "with the new name")
+    eq(st.history[#st.history][2], "Person Detected " .. DOT .. " Street North", "new title")
+end)
+
+test("an unchanged name is not registered again", function()
+    local st = simulatedPerson()
+    local before = #st.registered
+    st.set("History Cooldown", "0")
+    for _ = 1, 2 do
+        st.fireTimers()                               -- end the previous detection
+        ExecuteCommand("LUA_ACTION", { ACTION = "SimulatePerson" })
+    end
+    eq(#st.history, 3, "all three detections were recorded")
+    eq(#st.registered, before, "no repeat registrations")
+end)
+
+--=============================================================================
 print("\nRobustness")
 --=============================================================================
 
@@ -860,470 +1750,6 @@ end)
 test("diagnostics runs without error", function()
     local st = configured({ ["rtsps%-stream"] = { body = '{"low":"rtsps://h:7441/LOWTOK?enableSrtp"}' } })
     ExecuteCommand("LUA_ACTION", { ACTION = "Diagnostics" })
-end)
-
---=============================================================================
-print("\nPolling, recovery and load (v47)")
---=============================================================================
-
-local FULL_PROPS = { ["NVR Address"] = "192.0.2.10", ["API Key"] = "K", ["Camera ID"] = "CAM1",
-                     ["RTSP Alias - Low"] = "LOW" }
-
-local function pollCount(st, id)
-    local n = 0
-    for _, r in ipairs(st.requests) do
-        if r.method == "GET" and r.url:find("/cameras/" .. (id or "CAM1") .. "$") then n = n + 1 end
-    end
-    return n
-end
-
-local function countOf(list, v)
-    local n = 0
-    for _, x in ipairs(list) do if x == v then n = n + 1 end end
-    return n
-end
-
-local function tick(st) st.fireTimers(); st.flush() end
-
--- Like tick, but leaves the 7 s event hold timer alone, so activity that
--- continues across polls stays inside one hold window.
-local function tickHolding(st)
-    st.fireTimers(function(t) return t.ms ~= 7000 end)
-    st.flush()
-end
-local HOLD7 = { ["Event Hold Time"] = "7" }
-local function withFull(extra)
-    local p = {}
-    for k, v in pairs(FULL_PROPS) do p[k] = v end
-    for k, v in pairs(extra or {}) do p[k] = v end
-    return p
-end
-
-local function camBody(o)
-    o = o or {}
-    local parts = {}
-    if o.state ~= false then parts[#parts + 1] = string.format('"state":"%s"', o.state or "CONNECTED") end
-    parts[#parts + 1] = '"id":"' .. (o.id or "CAM1") .. '"'
-    parts[#parts + 1] = '"name":"' .. (o.name or "Front") .. '"'
-    parts[#parts + 1] = '"lastMotion":' .. (o.motion or 0)
-    parts[#parts + 1] = '"lastRing":' .. (o.ring or 0)
-    return "{" .. table.concat(parts, ",") .. "}"
-end
-
-local function aliasRoute(map)
-    return function(method, url)
-        if method ~= "GET" then return 200, "{}" end
-        local id = url:match("cameras/(%w+)/rtsps%-stream")
-        return 200, string.format('{"low":"rtsps://h:7441/%s"}', map[id] or "TOK")
-    end
-end
-
--- Props as Composer would have stored them, applied by OnDriverLateInit (not
--- through OnPropertyChanged), so the load path is what gets exercised.
-local function loaded(routes, props, async)
-    local st = stub.new({ routes = routes or {}, async = async })
-    st.load(CAM .. "driver.lua")
-    st.props["Log Mode"] = "Off"
-    st.props["Event Polling Interval"] = "5 Seconds"
-    for k, v in pairs(props or {}) do st.props[k] = v end
-    OnDriverLateInit()
-    return st
-end
-
-local FULL = FULL_PROPS
-
--- A camera created by the setup driver loaded with nothing configured, then
--- received its configuration. Nothing started polling until the next reload.
-test("polling starts when the setup driver configures a new camera", function()
-    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody() end,
-                        ["rtsps%-stream"] = aliasRoute({}) })
-    eq(pollCount(st), 0, "polls before config")
-    ExecuteCommand("SET_PROTECT_CONFIG", { address = "192.0.2.10", api_key = "K",
-        camera_id = "CAM1", camera_name = "Front", snapshots = "Off", enable_rtsp = "Yes" })
-    tick(st); tick(st)
-    truthy(pollCount(st) >= 1, "event poll issued after configuration")
-end)
-
--- Same gap, configured by hand in Composer.
-test("polling starts when address, key and camera are entered by hand", function()
-    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody() end,
-        ["rtsps%-stream"] = aliasRoute({}),
-        ["/cameras$"] = { body = '{"cameras":[{"id":"CAM1","name":"Front"}]}' } })
-    st.set("NVR Address", "192.0.2.10"); st.set("API Key", "K")
-    ExecuteCommand("LUA_ACTION", { ACTION = "DiscoverCameras" }); st.flush()
-    st.set("Camera", "Front"); st.flush()
-    tick(st); tick(st)
-    truthy(pollCount(st) >= 1, "event poll issued")
-end)
-
--- Events do not need streams. Boot polling was gated on a stored RTSP alias,
--- so a camera with RTSP off (or unreachable at boot) never reported events.
-test("polling does not wait for an RTSP alias", function()
-    local props = { ["NVR Address"] = "192.0.2.10", ["API Key"] = "K", ["Camera ID"] = "CAM1",
-                    ["Enable RTSP Automatically"] = "No" }
-    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody() end,
-                        ["rtsps%-stream"] = { code = 404 } }, props)
-    tick(st); tick(st)
-    truthy(pollCount(st) >= 1, "event poll issued without an alias")
-end)
-
-test("polling stays off when the interval is Off", function()
-    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody() end },
-        { ["NVR Address"] = "192.0.2.10", ["API Key"] = "K", ["Camera ID"] = "CAM1",
-          ["Event Polling Interval"] = "Off" })
-    tick(st); tick(st)
-    eq(pollCount(st), 0, "polls with polling Off")
-end)
-
--- Camera drivers all load together; the console's rate limit was tripped by
--- sixteen requests in one instant. Startup requests wait for a timer.
-test("startup does not hit the console synchronously", function()
-    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody() end,
-                        ["rtsps%-stream"] = aliasRoute({}),
-                        ["/cameras$"] = { body = '{"cameras":[]}' } }, FULL)
-    eq(#st.requests, 0, "requests issued inside OnDriverLateInit")
-    tick(st)
-    truthy(#st.requests > 0, "requests follow once the startup timers fire")
-end)
-
--- One exception while handling a reply used to end polling for good, because
--- the next tick is only scheduled after the handler returns.
-test("an error while handling a reply does not end polling", function()
-    local m = 1000
-    local st = loaded({ ["cameras/CAM1$"] = function() m = m + 1000; return 200, camBody({ motion = m }) end }, FULL)
-    tick(st)                                   -- baseline poll
-    local before = pollCount(st)
-    local realFire = st.C4.FireEvent
-    st.C4.FireEvent = function() error("simulated Director fault") end
-    tick(st)                                   -- this reply makes the handler throw
-    st.C4.FireEvent = realFire
-    tick(st)
-    truthy(pollCount(st) > before + 1, "polling continued after the fault")
-end)
-
--- If OnDone is never delivered, nothing ever scheduled the next poll and
--- polling stopped without a trace.
-test("a poll that never gets a reply is abandoned and polling resumes", function()
-    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody() end }, FULL, true)
-    st.fireTimers()                                   -- first poll goes out; its reply is never flushed
-    eq(pollCount(st), 1, "first poll")
-    st.fireTimers(function(t) return t.ms == 60000 end)   -- the stall watchdog
-    st.fireTimers()                                   -- the poll it rescheduled
-    eq(pollCount(st), 2, "a new poll after the stall")
-    st.flush()                                        -- the abandoned reply finally lands: harmless
-    truthy(pollCount(st) >= 2, "still polling")
-end)
-
---=============================================================================
-print("\nCamera changes with requests in flight")
---=============================================================================
-
--- Selecting CAM2 while CAM1's alias request was in flight let CAM1's late
--- reply overwrite CAM2's stream token: wrong video, no error.
-test("a late alias reply for the previous camera is discarded", function()
-    local st = loaded({ ["rtsps%-stream"] = aliasRoute({ CAM1 = "AAAA", CAM2 = "BBBB" }) },
-        { ["NVR Address"] = "192.0.2.10", ["API Key"] = "K", ["Camera ID"] = "CAM1" }, true)
-    st.pending = {}
-    fetchAliases()
-    local first = st.pending; st.pending = {}        -- CAM1's request, in flight
-    st.set("Camera ID", "CAM2")                      -- the switch issues CAM2's own request
-    local second = st.pending; st.pending = {}
-    for _, f in ipairs(second) do f() end            -- CAM2's reply arrives first...
-    for _, f in ipairs(first) do f() end             -- ...then CAM1's, late
-    eq(st.props["RTSP Alias - Low"], "BBBB", "stored Low alias")
-    contains(UIRequest("GET_RTSP_H264_QUERY_STRING", { SIZE_X = 640 }), "BBBB", "token served")
-end)
-
-test("switching camera clears the old camera's tokens", function()
-    local st = configured({ ["rtsps%-stream"] = { code = 429 } })
-    truthy(st.props["RTSP Alias - Low"] ~= "", "precondition: alias present")
-    st.set("Camera ID", "CAM2")
-    eq(st.props["RTSP Alias - Low"], "", "Low alias after switching")
-end)
-
--- A poll issued for the old camera must not report state for the new one.
-test("a late poll reply for the previous camera is ignored", function()
-    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody({ name = "OldCamera" }) end },
-        { ["NVR Address"] = "192.0.2.10", ["API Key"] = "K", ["Camera ID"] = "CAM1",
-          ["RTSP Alias - Low"] = "LOW" }, true)
-    st.fireTimers()                            -- poll for CAM1 goes out
-    local old = st.pending; st.pending = {}
-    st.set("Camera ID", "CAM2")
-    for _, f in ipairs(old) do f() end         -- its reply lands after the switch
-    truthy(st.props["Camera Name"] ~= "OldCamera", "name taken from the old camera's reply")
-end)
-
---=============================================================================
-print("\nStatus recovery")
---=============================================================================
-
-local function failingTransport(st, state)
-    local orig = st.C4.url
-    st.C4.url = function(self)
-        local o = orig(self)
-        local get = o.Get
-        o.Get = function(o2, url, h)
-            if state.fail then o2._done(o2, nil, 28, "timeout"); return o2 end
-            return get(o2, url, h)
-        end
-        return o
-    end
-end
-
--- Any single quiet-poll timeout set "Unreachable", which then never cleared.
-test("one poll timeout does not report the console unreachable", function()
-    local st = configured({ ["cameras/CAM1$"] = function() return 200, camBody() end })
-    st.set("Event Polling Interval", "5 Seconds")
-    local state = { fail = true }
-    failingTransport(st, state)
-    poll()
-    truthy(st.props["Driver Status"] ~= "Unreachable - check NVR Address", "after one timeout")
-end)
-
-test("Unreachable clears when the console answers again", function()
-    local st = configured({ ["cameras/CAM1$"] = function() return 200, camBody() end,
-                            ["meta/info"] = { body = '{"applicationVersion":"6.0"}' } })
-    st.set("Event Polling Interval", "5 Seconds")
-    local state = { fail = true }
-    failingTransport(st, state)
-    for _ = 1, 3 do poll(); st.fireTimers() end
-    eq(st.props["Driver Status"], "Unreachable - check NVR Address", "after a streak of timeouts")
-    state.fail = false
-    poll(); st.fireTimers(); st.flush()
-    truthy(st.props["Driver Status"] ~= "Unreachable - check NVR Address", "after the console answers")
-end)
-
--- "Auth Failed" outlived the fix: the key handler only stored the new value.
-test("Auth Failed clears when the API key is corrected", function()
-    local code = 401
-    local st = configured({ ["meta/info"] = function() return code, '{"applicationVersion":"6.0"}' end })
-    ExecuteCommand("LUA_ACTION", { ACTION = "TestConnection" })
-    eq(st.props["Driver Status"], "Auth Failed - check API Key", "with a bad key")
-    code = 200
-    st.set("API Key", "GOODKEY")
-    truthy(st.props["Driver Status"] ~= "Auth Failed - check API Key", "after fixing the key")
-end)
-
---=============================================================================
-print("\nEvent edge cases")
---=============================================================================
-
--- A reply missing 'state' reported the camera offline, then online again.
-test("a reply without a connection state is ignored", function()
-    local body = camBody()
-    local st = loaded({ ["cameras/CAM1$"] = function() return 200, body end }, FULL)
-    tick(st)
-    body = '{"id":"CAM1"}'
-    tick(st); tick(st)
-    eq(countOf(st.events, 8), 0, "offline events")
-    eq(countOf(st.events, 9), 0, "online events")
-end)
-
--- A truncated reply must not set a zero baseline that makes history look new.
-test("a truncated reply does not replay old motion", function()
-    local body = '{"id":"CAM1"}'                   -- the very first reply is truncated
-    local st = loaded({ ["cameras/CAM1$"] = function() return 200, body end }, FULL)
-    tick(st)
-    body = camBody({ motion = 5000 }); tick(st)     -- full reply: history, not news
-    tick(st)
-    eq(countOf(st.events, 1), 0, "motion events from replayed history")
-end)
-
--- With lastRing at 0 at load, the first real ring was taken as the baseline.
-test("the first ring on a doorbell that has never rung fires", function()
-    local ring = 0
-    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody({ ring = ring }) end }, FULL)
-    tick(st)
-    ring = 2000000
-    tick(st)
-    eq(countOf(st.events, 7), 1, "doorbell events for the first ring")
-end)
-
-test("history present at load is not replayed", function()
-    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody({ ring = 999, motion = 999 }) end }, FULL)
-    tick(st); tick(st)
-    eq(countOf(st.events, 7), 0, "doorbell")
-    eq(countOf(st.events, 1), 0, "motion")
-end)
-
--- Protect keeps advancing lastMotion while motion continues; each advance
--- fired "motion started" again and made Director re-run programming.
-test("sustained motion fires one event, not one per poll", function()
-    local m = 1000
-    local st = loaded({ ["cameras/CAM1$"] = function() m = m + 1000; return 200, camBody({ motion = m }) end },
-        withFull(HOLD7))
-    for _ = 1, 6 do tickHolding(st) end
-    eq(countOf(st.events, 1), 1, "motion-start events during one episode")
-end)
-
-test("motion fires again once the hold window has cleared it", function()
-    local m = 1000
-    local st = loaded({ ["cameras/CAM1$"] = function() m = m + 1000; return 200, camBody({ motion = m }) end },
-        withFull(HOLD7))
-    tickHolding(st); tickHolding(st)
-    eq(countOf(st.events, 1), 1, "first episode")
-    st.fireTimers(function(t) return t.ms == 7000 end)   -- only the hold-window timer
-    eq(st.vars["MOTION_DETECTED"], "false", "variable cleared")
-    tick(st)
-    eq(countOf(st.events, 1), 2, "second episode")
-end)
-
-test("every doorbell ring fires, even inside the hold window", function()
-    local ring = 1000
-    local st = loaded({ ["cameras/CAM1$"] = function() ring = ring + 1000; return 200, camBody({ ring = ring }) end },
-        withFull(HOLD7))
-    tickHolding(st); tickHolding(st); tickHolding(st)
-    truthy(countOf(st.events, 7) >= 2, "doorbell events for consecutive rings")
-end)
-
--- g.online started false, so every restart announced "camera online".
-test("a restart does not announce the camera as online", function()
-    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody() end }, FULL)
-    tick(st); tick(st)
-    eq(countOf(st.events, 9), 0, "online events at startup")
-end)
-
-test("going offline then online fires both events once", function()
-    local state = "CONNECTED"
-    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody({ state = state }) end,
-                        ["rtsps%-stream"] = aliasRoute({}) }, FULL)
-    tick(st)
-    state = "DISCONNECTED"; tick(st)
-    state = "CONNECTED"; tick(st); tick(st)
-    eq(countOf(st.events, 8), 1, "offline events")
-    eq(countOf(st.events, 9), 1, "online events")
-end)
-
---=============================================================================
-print("\nStream tokens")
---=============================================================================
-
--- Tokens were only fetched when none were stored, so ones Protect had since
--- rotated were served until someone ran Fetch Stream Aliases.
-test("stored tokens are refreshed at startup", function()
-    local st = loaded({ ["rtsps%-stream"] = aliasRoute({ CAM1 = "FRESH" }),
-                        ["/cameras$"] = { body = '{"cameras":[]}' } },
-        { ["NVR Address"] = "192.0.2.10", ["API Key"] = "K", ["Camera ID"] = "CAM1",
-          ["RTSP Alias - Low"] = "STALE", ["Event Polling Interval"] = "Off" })
-    tick(st)
-    eq(st.props["RTSP Alias - Low"], "FRESH", "alias after the startup refresh")
-end)
-
--- Refreshing must never be the reason RTSP gets switched on in Protect.
-test("a startup refresh does not enable RTSP in Protect", function()
-    local st = loaded({ ["rtsps%-stream"] = { code = 404 }, ["/cameras$"] = { body = '{"cameras":[]}' } },
-        { ["NVR Address"] = "192.0.2.10", ["API Key"] = "K", ["Camera ID"] = "CAM1",
-          ["RTSP Alias - Low"] = "STALE", ["Enable RTSP Automatically"] = "Yes",
-          ["Event Polling Interval"] = "Off" })
-    tick(st); tick(st)
-    for _, r in ipairs(st.requests) do
-        truthy(r.method ~= "POST", "unexpected POST " .. r.url)
-    end
-end)
-
-test("tokens are re-read when a camera comes back online", function()
-    local state = "CONNECTED"
-    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody({ state = state }) end,
-                        ["rtsps%-stream"] = aliasRoute({ CAM1 = "ROTATED" }) }, FULL)
-    tick(st)
-    state = "DISCONNECTED"; tick(st)
-    state = "CONNECTED"; tick(st); tick(st)
-    eq(st.props["RTSP Alias - Low"], "ROTATED", "alias after reconnect")
-end)
-
---=============================================================================
-print("\nSnapshot listener")
---=============================================================================
-
-local function snapshotSetup(routes)
-    local st = loaded(routes, { ["NVR Address"] = "192.0.2.10", ["API Key"] = "K", ["Camera ID"] = "CAM1",
-        ["RTSP Alias - Low"] = "LOW", ["Snapshots"] = "On", ["Event Polling Interval"] = "Off" }, true)
-    OnServerStatusChanged(4000, "ONLINE", "snapshot")
-    local replies = {}
-    st.C4.ServerSend = function(_, h, data) replies[#replies + 1] = { handle = h, data = data } end
-    return st, replies
-end
-
-local function statusOf(r) return r.data:match("^HTTP/1.1 (%d+)") end
-
--- A second request while the first fetch was running got a 503 whenever the
--- cache was empty, which is exactly when Navigator opens several at once.
-test("simultaneous requests with an empty cache are all served", function()
-    local st, replies = snapshotSetup({ ["snapshot"] = function() return 200, string.rep("J", 2000) end })
-    OnServerDataIn(1, "GET /snapshot.jpg HTTP/1.1\r\n\r\n")
-    OnServerDataIn(2, "GET /snapshot.jpg HTTP/1.1\r\n\r\n")
-    st.flush()
-    eq(#replies, 2, "replies")
-    eq(statusOf(replies[1]), "200", "first")
-    eq(statusOf(replies[2]), "200", "second")
-end)
-
-test("a failed fetch with nothing cached answers 503", function()
-    local st, replies = snapshotSetup({ ["snapshot"] = { code = 500 } })
-    OnServerDataIn(1, "GET /snapshot.jpg HTTP/1.1\r\n\r\n")
-    st.flush()
-    eq(statusOf(replies[1]), "503", "status")
-end)
-
--- "Stale beats blank" had no limit: a failing console kept serving the same
--- frame indefinitely, hiding the outage.
-test("a frame older than a minute is not served when the refresh fails", function()
-    local now, code = 7000000, 200
-    local realTime = os.time
-    os.time = function() return now end
-    local ok, err = pcall(function()
-        local st, replies = snapshotSetup({ ["snapshot"] = function() return code, string.rep("J", 2000) end })
-        OnServerDataIn(1, "GET /snapshot.jpg HTTP/1.1\r\n\r\n"); st.flush()
-        eq(statusOf(replies[1]), "200", "fresh fetch")
-        code = 500
-        now = now + 30
-        OnServerDataIn(2, "GET /snapshot.jpg HTTP/1.1\r\n\r\n"); st.flush()
-        eq(statusOf(replies[2]), "200", "30s-old frame still served")
-        now = now + 61
-        OnServerDataIn(3, "GET /snapshot.jpg HTTP/1.1\r\n\r\n"); st.flush()
-        eq(statusOf(replies[3]), "503", "91s-old frame refused")
-    end)
-    os.time = realTime
-    if not ok then error(err, 0) end
-end)
-
--- A frame fetched for the previous camera landed after the switch and was
--- served as the new camera's picture.
-test("a snapshot in flight for the previous camera is not served", function()
-    local st, replies = snapshotSetup({
-        ["snapshot"] = function(m, url) return 200, url:find("CAM2") and "IMG-CAM2" or "IMG-CAM1" end })
-    OnServerDataIn(1, "GET /snapshot.jpg HTTP/1.1\r\n\r\n")      -- fetch for CAM1 in flight
-    local old = st.pending; st.pending = {}
-    st.set("Camera ID", "CAM2")
-    for _, f in ipairs(old) do f() end                            -- stale reply lands
-    OnServerDataIn(2, "GET /snapshot.jpg HTTP/1.1\r\n\r\n"); st.flush()
-    local last = replies[#replies]
-    contains(last.data, "IMG-CAM2", "frame served after the switch")
-    truthy(not last.data:find("IMG-CAM1", 1, true), "old camera's frame")
-end)
-
--- Configuration arriving before the listener reported ONLINE created a second
--- listener; the first, whose port was not yet known, could never be destroyed.
-test("configuration during listener start-up does not create a second listener", function()
-    local st = stub.new()
-    st.load(CAM .. "driver.lua")
-    st.props["Log Mode"] = "Off"; st.props["Snapshots"] = "On"
-    OnDriverLateInit()
-    ExecuteCommand("SET_PROTECT_CONFIG", { address = "192.0.2.10", api_key = "K",
-        camera_id = "CAM1", snapshots = "On" })
-    eq(#st.servers, 1, "CreateServer calls after config")
-    st.set("Controller Address", "192.0.2.99")        -- also routes straight to startSnapshotServer
-    eq(#st.servers, 1, "CreateServer calls after a property change")
-end)
-
-test("a listener that comes up after Snapshots was switched off is destroyed", function()
-    local st = stub.new()
-    st.load(CAM .. "driver.lua")
-    st.props["Log Mode"] = "Off"; st.props["Snapshots"] = "On"
-    OnDriverLateInit()
-    st.set("Snapshots", "Off")
-    OnServerStatusChanged(4001, "ONLINE", "snapshot")
-    eq(st.destroyed[#st.destroyed], 4001, "port destroyed")
 end)
 
 --=============================================================================

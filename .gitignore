@@ -1,0 +1,15 @@
+# Build output - drivers are published as release assets, not committed
+dist/
+*.c4z
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~
+
+# Python
+__pycache__/
+*.pyc
