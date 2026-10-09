@@ -28,6 +28,12 @@ local g = {
     apiKey    = "",
     snapshots = "Off",
     enableRtsp = "Yes",
+    -- Forwarded to every camera. Defaults match the camera driver's.
+    detect  = { Person = "Yes", Vehicle = "Yes", Animal = "No", Package = "No",
+                Motion = "Yes", Doorbell = "Yes" },
+    history = { Person = "Yes", Vehicle = "No", Animal = "No", Package = "Yes",
+                Motion = "No", Doorbell = "Yes" },
+    historyCooldown = "60",
     logMode   = "Off",
     logLevel  = 2,
     cameras   = {},      -- latest list from Protect: { {id=, name=}, ... }
@@ -227,6 +233,13 @@ local function configFor(cam)
         camera_name = cam.name,
         snapshots   = g.snapshots,
         enable_rtsp = g.enableRtsp,
+        detect_person   = g.detect.Person,   history_person   = g.history.Person,
+        detect_vehicle  = g.detect.Vehicle,  history_vehicle  = g.history.Vehicle,
+        detect_animal   = g.detect.Animal,   history_animal   = g.history.Animal,
+        detect_package  = g.detect.Package,  history_package  = g.history.Package,
+        detect_motion   = g.detect.Motion,   history_motion   = g.history.Motion,
+        detect_doorbell = g.detect.Doorbell, history_doorbell = g.history.Doorbell,
+        history_cooldown = g.historyCooldown,
         parent_id   = tostring(C4:GetDeviceID()),
     }
 end
@@ -244,45 +257,16 @@ end
 --=============================================================================
 -- Staggering
 --=============================================================================
--- Each job is job(finish) and must call finish() when its work is complete.
--- AddDevice answers asynchronously, so "the last job started" is not "done":
--- reporting Done (and allowing another sync) at that point could add the same
--- camera twice.
 local function runStaggered(jobs, onDone)
     if #jobs == 0 then
         if onDone then onDone() end
         return
     end
-    local remaining, finished = #jobs, false
-    local function complete()
-        if finished then return end
-        finished = true
-        if onDone then onDone() end
-    end
-    local function oneDone()
-        remaining = remaining - 1
-        if remaining <= 0 then complete() end
-    end
-    -- If a callback never arrives, do not leave the driver "busy" forever.
-    C4:SetTimer(#jobs * STAGGER_MS + 30000, function()
-        if not finished then
-            log(LVL.WARN, "Some cameras did not confirm; releasing the sync")
-            complete()
-        end
-    end)
     for i, job in ipairs(jobs) do
+        local last = (i == #jobs)
         local run = function()
-            local called = false
-            local function finish()
-                if called then return end
-                called = true
-                oneDone()
-            end
-            local ok, err = pcall(job, finish)
-            if not ok then
-                log(LVL.ERROR, "Camera job failed: %s", tostring(err))
-                finish()
-            end
+            job()
+            if last and onDone then onDone() end
         end
         if i == 1 then run() else C4:SetTimer((i - 1) * STAGGER_MS, run) end
     end
@@ -293,27 +277,6 @@ end
 --=============================================================================
 local function finishSync()
     local managed = getManaged()
-
-    -- A camera driver deleted in Composer leaves its device ID behind, and the
-    -- camera would never be recreated. Drop IDs that no longer exist. An empty
-    -- or unusable answer proves nothing (it could mean "all deleted" or "lookup
-    -- failed"), so only a non-empty list is trusted.
-    local existing = C4:GetDevicesByC4iName(CAMERA_DRIVER)
-    if type(existing) == "table" and next(existing) ~= nil then
-        local alive = {}
-        for rawId in pairs(existing) do alive[tonumber(rawId)] = true end
-        local pruned = false
-        for camId, devId in pairs(managed) do
-            if not alive[tonumber(devId)] then
-                managed[camId] = nil
-                pruned = true
-                log(LVL.WARN, "Driver %s for camera %s no longer exists; it will be recreated",
-                    tostring(devId), tostring(camId))
-            end
-        end
-        if pruned then saveManaged(managed) end
-    end
-
     local room = C4:RoomGetId()
     local jobs, added, updated = {}, 0, 0
 
@@ -321,15 +284,14 @@ local function finishSync()
         local devId = managed[cam.id]
         if devId then
             updated = updated + 1
-            table.insert(jobs, function(finish) pushConfig(devId, cam); finish() end)
+            table.insert(jobs, function() pushConfig(devId, cam) end)
         else
             added = added + 1
-            table.insert(jobs, function(finish)
+            table.insert(jobs, function()
                 C4:AddDevice(CAMERA_DRIVER, room, displayName(cam), function(newId)
                     if not newId or newId == 0 then
                         log(LVL.ERROR, "Could not add a driver for %s. Is %s loaded in Composer?",
                             displayName(cam), CAMERA_DRIVER)
-                        finish()
                         return
                     end
                     local m = getManaged()
@@ -337,7 +299,6 @@ local function finishSync()
                     saveManaged(m)
                     pushConfig(newId, cam)
                     log(LVL.INFO, "Added %s (device %d)", displayName(cam), newId)
-                    finish()
                 end)
             end)
         end
@@ -420,7 +381,7 @@ local function pushSettings()
     local jobs = {}
     for camId, devId in pairs(managed) do
         local cam = byId[camId] or { id = camId }
-        table.insert(jobs, function(finish) pushConfig(devId, cam); finish() end)
+        table.insert(jobs, function() pushConfig(devId, cam) end)
     end
     local n = #jobs
     status(string.format("Pushing settings to %d camera%s...", n, n == 1 and "" or "s"))
@@ -491,13 +452,27 @@ function OnPropertyChanged(name)
     elseif name == "API Key" then g.apiKey = (v:gsub("^%s*(.-)%s*$", "%1"))
     elseif name == "Snapshots" then g.snapshots = v
     elseif name == "Enable RTSP in Protect" then g.enableRtsp = v
+    elseif name == "Detect Person" then g.detect.Person = v
+    elseif name == "History - Person" then g.history.Person = v
+    elseif name == "Detect Vehicle" then g.detect.Vehicle = v
+    elseif name == "History - Vehicle" then g.history.Vehicle = v
+    elseif name == "Detect Animal" then g.detect.Animal = v
+    elseif name == "History - Animal" then g.history.Animal = v
+    elseif name == "Detect Package" then g.detect.Package = v
+    elseif name == "History - Package" then g.history.Package = v
+    elseif name == "Detect Motion" then g.detect.Motion = v
+    elseif name == "History - Motion" then g.history.Motion = v
+    elseif name == "Detect Doorbell" then g.detect.Doorbell = v
+    elseif name == "History - Doorbell" then g.history.Doorbell = v
+    elseif name == "History Cooldown" then g.historyCooldown = tostring(v)
     elseif name == "Log Mode" then g.logMode = v
     elseif name == "Log Level" then g.logLevel = tonumber(v:sub(1, 1)) or 2
     end
 end
 
 function OnDriverLateInit()
-    for _, name in ipairs({ "Log Mode", "Log Level", "NVR Address", "API Key", "Snapshots", "Enable RTSP in Protect" }) do
+    for _, name in ipairs({ "Log Mode", "Log Level", "NVR Address", "API Key", "Snapshots", "Enable RTSP in Protect",
+                            "Detect Person", "History - Person", "Detect Vehicle", "History - Vehicle", "Detect Animal", "History - Animal", "Detect Package", "History - Package", "Detect Motion", "History - Motion", "Detect Doorbell", "History - Doorbell", "History Cooldown" }) do
         pcall(OnPropertyChanged, name)
     end
     C4:UpdateProperty("Driver Version", DRIVER_VERSION)

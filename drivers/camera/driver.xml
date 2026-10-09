@@ -2,11 +2,11 @@
   <copyright>2026</copyright>
   <creator>Efi</creator>
   <manufacturer>Ubiquiti</manufacturer>
-  <name>UniFi Protect Camera (Standalone)</name>
+  <name>UniFi Protect Camera</name>
   <model>UniFi Protect Camera</model>
   <created>09/10/2026</created>
   <modified>09/10/2026</modified>
-  <version>47</version>
+  <version>52</version>
   <small>devices_sm/camera.gif</small>
   <large>devices_lg/camera.gif</large>
   <control>lua_gen</control>
@@ -140,6 +140,25 @@
       <description>Leave blank to detect automatically. Set only if thumbnails do not load.</description>
     </property>
     <property>
+      <name>Event Source</name>
+      <type>LIST</type>
+      <readonly>false</readonly>
+      <default>WebSocket (instant)</default>
+      <items>
+        <item>WebSocket (instant)</item>
+        <item>Polling</item>
+        <item>Off</item>
+      </items>
+      <description>WebSocket: Protect pushes each detection as it happens, with its real end time, over one persistent connection and no periodic requests. Polling: the driver asks at Event Polling Interval. Off: no detection events.</description>
+    </property>
+    <property>
+      <name>Event Stream</name>
+      <type>STRING</type>
+      <readonly>true</readonly>
+      <default>Off</default>
+      <description>State of the WebSocket connection to Protect.</description>
+    </property>
+    <property>
       <name>Event Polling Interval</name>
       <type>LIST</type>
       <readonly>false</readonly>
@@ -154,7 +173,7 @@
         <item>30 Seconds</item>
         <item>60 Seconds</item>
       </items>
-      <description>How often this camera is polled for events. Every camera driver polls independently, so on an 8-camera system 2 Seconds means roughly 14,400 console requests per hour. Set Off if you do not need Control4 events.</description>
+      <description>Used when Event Source is Polling, and as a fallback while the WebSocket reconnects. How often this camera is polled for events. Every camera driver polls independently, so on an 8-camera system 2 Seconds means roughly 14,400 console requests per hour. Set Off if you do not need Control4 events.</description>
     </property>
     <property>
       <name>Adaptive Polling</name>
@@ -209,6 +228,20 @@
       <items><item>Yes</item><item>No</item></items>
     </property>
     <property>
+      <name>Detect Motion</name>
+      <type>LIST</type>
+      <readonly>false</readonly>
+      <default>Yes</default>
+      <items><item>Yes</item><item>No</item></items>
+    </property>
+    <property>
+      <name>Detect Doorbell</name>
+      <type>LIST</type>
+      <readonly>false</readonly>
+      <default>Yes</default>
+      <items><item>Yes</item><item>No</item></items>
+    </property>
+    <property>
       <name>Event Hold Time</name>
       <type>RANGED_INTEGER</type>
       <readonly>false</readonly>
@@ -218,6 +251,63 @@
       <description>Watchdog only. State clears on the event's end when Protect reports one.</description>
     </property>
 
+    <property>
+      <name>History - Person</name>
+      <type>LIST</type>
+      <readonly>false</readonly>
+      <default>Yes</default>
+      <items><item>Yes</item><item>No</item></items>
+      <description>Record person events in the Control4 app's History timeline. Independent of Detect Person, which controls programming events and variables.</description>
+    </property>
+    <property>
+      <name>History - Vehicle</name>
+      <type>LIST</type>
+      <readonly>false</readonly>
+      <default>No</default>
+      <items><item>Yes</item><item>No</item></items>
+      <description>Record vehicle events in the Control4 app's History timeline. Independent of Detect Vehicle, which controls programming events and variables.</description>
+    </property>
+    <property>
+      <name>History - Animal</name>
+      <type>LIST</type>
+      <readonly>false</readonly>
+      <default>No</default>
+      <items><item>Yes</item><item>No</item></items>
+      <description>Record animal events in the Control4 app's History timeline. Independent of Detect Animal, which controls programming events and variables.</description>
+    </property>
+    <property>
+      <name>History - Package</name>
+      <type>LIST</type>
+      <readonly>false</readonly>
+      <default>Yes</default>
+      <items><item>Yes</item><item>No</item></items>
+      <description>Record package events in the Control4 app's History timeline. Independent of Detect Package, which controls programming events and variables.</description>
+    </property>
+    <property>
+      <name>History - Motion</name>
+      <type>LIST</type>
+      <readonly>false</readonly>
+      <default>No</default>
+      <items><item>Yes</item><item>No</item></items>
+      <description>Record motion events in the Control4 app's History timeline. Independent of Detect Motion, which controls programming events and variables.</description>
+    </property>
+    <property>
+      <name>History - Doorbell</name>
+      <type>LIST</type>
+      <readonly>false</readonly>
+      <default>Yes</default>
+      <items><item>Yes</item><item>No</item></items>
+      <description>Record doorbell events in the Control4 app's History timeline. Independent of Detect Doorbell, which controls programming events and variables.</description>
+    </property>
+    <property>
+      <name>History Cooldown</name>
+      <type>RANGED_INTEGER</type>
+      <readonly>false</readonly>
+      <default>60</default>
+      <minimum>0</minimum>
+      <maximum>3600</maximum>
+      <description>Seconds before the same event type is recorded again for this camera. Keeps the timeline readable and the History database small.</description>
+    </property>
     <property>
       <name>Log Mode</name>
       <type>LIST</type>
@@ -265,6 +355,11 @@
       <name>Enable RTSP Streams</name>
       <command>EnableRtsp</command>
       <description>Asks Protect to turn RTSP on for all three qualities on this camera (API Key mode only).</description>
+    </action>
+    <action>
+      <name>Use Protect Camera Name</name>
+      <command>UseCameraName</command>
+      <description>Renames this device to the camera's name in Protect, replacing any name you gave it. History entries and Navigator use the device name.</description>
     </action>
     <action>
       <name>Run Diagnostics</name>

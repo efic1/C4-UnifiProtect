@@ -3,36 +3,58 @@
 Versions are the integer in each driver's `<version>`, which Composer uses to compare updates.
 Earlier development builds are summarised rather than listed individually.
 
-## Camera driver 47 / Setup driver 4
+## Camera driver 52
 
-Found in a code review for edge cases and controller load. Each item has a regression test.
+- History entries now carry the camera's name in their title ("Person Detected · Street North -
+  G6"), or the installer's name for the device if one was chosen. Field testing showed History labels
+  records with the driver's definition name and ignores renaming devices entirely.
+- The driver device is no longer renamed: it had no visible effect, and each rename refreshes the
+  whole project. The Composer-visible device is still named after the camera.
+- The driver's name drops "(Standalone)".
 
-### Camera driver
-- **Polling starts when it should.** It now starts as soon as address, key and camera are known:
-  after the setup driver configures a new camera, after hand entry in Composer, and at boot even
-  when no RTSP alias is stored. Previously a new camera did not report events until a reload.
-- **Polling survives faults.** An exception while handling a reply no longer ends the poll chain, and
-  a watchdog abandons a poll whose reply never arrives.
-- **Replies for a previous camera are discarded** (aliases, polls, snapshots), so switching camera
-  can no longer leave the old camera's stream token or frame on the new one.
-- **Status recovers.** "Unreachable" and "Auth Failed" clear when the console answers again or the
-  address or key is corrected, and a single poll timeout no longer reports "Unreachable".
-- **Events:** a reply without a connection state is ignored (it used to fire offline then online);
-  the first event after load is no longer swallowed when its timestamp was 0; continuous motion
-  fires the event once per episode instead of once per poll (doorbell rings still fire every time);
-  a restart no longer announces the camera as online.
-- **Stream tokens are refreshed** at startup and when a camera comes back online. A refresh never
-  turns RTSP on in Protect.
-- **Controller load:** startup requests are spread over several seconds, the first poll is offset
-  per camera, and the random generator is seeded per device so retry jitter differs between cameras.
-- **Snapshot listener:** simultaneous requests share one fetch instead of some getting a 503;
-  configuration arriving while the listener starts no longer creates a second one; a frame older
-  than a minute is no longer served when refreshes fail.
+## Camera driver 51
 
-### Setup driver
-- A camera driver deleted in Composer is recreated on the next sync.
-- "Done" is reported when the last driver has actually been created, and a sync that never
-  completes releases itself after 30 seconds.
+- Fixed: `C4:GetProxyDevices()` returns a number, not a table, so the proxy id was always empty. The
+  Composer-visible device was therefore never renamed, and History event types were never
+  registered. Both now work.
+
+## Camera driver 50
+
+- Fixed: History still showed "UniFi Protect Camera (Standalone)". History labels records with the
+  driver's own device, not the proxy that v49 renamed. Both are now named; the driver device mirrors
+  the proxy, so History shows whatever name you see in Composer, including one you chose.
+- Cameras configured by hand before v49 had no stored camera name, so nothing was renamed. The name
+  is now looked up once at startup when missing.
+- Run Diagnostics shows the camera, proxy and driver names.
+
+## Camera driver 49
+
+- Each camera device is named after its Protect camera, so History entries show the camera rather
+  than "UniFi Protect Camera". Only a default name, or a name the driver set, is replaced; a name the
+  installer chose is kept. **Use Protect Camera Name** forces it. Renames happen only on a real
+  change, and at startup in each camera's own slot, because each rename refreshes the project.
+- Unmapped smart-detection classes are logged once per detection instead of on every update.
+
+## Camera driver 48 / Setup driver 4
+
+- **History**: events recorded in the Control4 app's timeline, chosen per type independently of
+  programming events (**History - Person** etc.), with a per-type cooldown. Event types are
+  registered with the History agent at startup, with retries.
+- **Detect Motion** and **Detect Doorbell** toggles; all six detection kinds can now be switched off.
+- The setup driver pushes the Detect and History choices to every camera.
+- **Load:** startup no longer fetches the camera list, and each camera's first requests go out in
+  its own random slot rather than all at once after a Director restart. Polling slows to once a
+  minute and adaptive bursts are suppressed while the event stream is live. Other cameras' events are
+  skipped before parsing, and frame parsing is linear. Diagnostics reports request and message counts.
+
+## Camera driver 47
+
+- Events now arrive over Protect's WebSocket event stream: sub-second, with real end times, and no
+  periodic API requests. New **Event Source** property (WebSocket, Polling, Off; default WebSocket)
+  and read-only **Event Stream** status.
+- Polling suppresses its own detections while the stream is live, and covers while it reconnects.
+- Fixed: clearing a detection did not cancel its watchdog timer, which could produce a second
+  "Ended" event.
 
 ## Camera driver 46 / Setup driver 3
 

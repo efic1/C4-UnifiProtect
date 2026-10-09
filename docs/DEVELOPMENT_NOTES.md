@@ -117,17 +117,6 @@ port". The proxy sends `SET_RTSP_PORT`. Handle both.
   outliving the success that should have replaced it. There is now exactly one writer, and a test
   that enforces it.
 
-- **A chain of one-shot timers is only as reliable as its weakest callback.** The poll schedules
-  its next tick from inside the reply handler, so an exception in that handler, or a reply that
-  never arrives, ends polling with no error. Wrap the handler in `pcall` and arm a watchdog.
-- **Every in-flight request needs to know which camera it was for.** Replies arrive in any order.
-  Capture a generation counter when the request goes out and drop the reply if it has changed.
-- **A "baseline" must be recorded even when the value is zero or absent.** Otherwise the first
-  real event is mistaken for the baseline and silently dropped.
-- **Do not let everything start at once.** Eight drivers loading together issue sixteen requests in
-  the same instant. Spread startup work with a per-device random delay, and seed the generator
-  (`math.randomseed`) per device or every driver draws the same "random" numbers.
-
 ---
 
 ## UniFi Protect (integration API, 6.x)
@@ -151,14 +140,97 @@ port". The proxy sends `SET_RTSP_PORT`. Handle both.
 
 ---
 
+## WebSocket without a WebSocket API
+
+DriverWorks has no WebSocket API. Since OS 3.1 Snap One ships a sample WebSocket client driver in
+the SDK, which shows it is intended to be built by hand. What it needs:
+
+- **TLS**: `C4:CreateNetworkConnection(6001, host, "SSL")`, then `C4:NetPortOptions(6001, 443,
+  "SSL", { VERIFY_MODE = "none", KEEP_CONNECTION = false, ... })` and `C4:NetConnect`. No XML is
+  needed for a dynamic connection. Verification is off by default, which Protect's self-signed
+  certificate requires. `C4:CreateTCPClient` has no TLS option and cannot be used.
+- **Handshake**: on `OnConnectionStatusChanged(..., "ONLINE")`, send the HTTP upgrade with
+  `X-API-KEY`. The 101 response and the first frame can arrive in the same read.
+- **Framing**: `ReceivedFromNetwork` delivers data split or merged arbitrarily; buffer it and parse
+  whole frames. Handle 16-bit and 64-bit lengths, continuation frames, ping (reply with a pong),
+  close. Client frames must be masked. Lua 5.1 has no bit operators and there is no documented base64
+  encoder, so both are small pure-Lua helpers.
+- **Reconnects** are the driver's, not Director's (`KEEP_CONNECTION = false`), so a refused key can
+  back off for minutes instead of being retried in a tight loop.
+
+## Protect's event stream
+
+`wss://<console>/proxy/protect/integration/v1/subscribe/events` with `X-API-KEY`. Messages are plain
+JSON text frames:
+
+```json
+{"type":"add","item":{"id":"...","modelKey":"event","type":"smartDetectZone",
+  "start":1700000000000,"device":"<camera id>","smartDetectTypes":["person"]}}
+```
+
+- `item.device` is the camera id; every camera's events arrive on every connection.
+- Event families include `ring`, `motion` and smart detections (`smartDetectZone`, `smartDetectLine`,
+  loiter), plus sensor, light and alarm-hub events.
+- A detection starts with `add`; updates can extend `smartDetectTypes` (e.g. `face`, then `face` and
+  `person`) and carry `end` when it finishes.
+- **A ring arrives with `start` and `end` together.** Deduplicate by event id and remember ids after
+  their end; forgetting an id at its end made a repeated ring message fire the doorbell twice.
+- An update arriving after an event's end must be ignored, or it can add a class to a finished event.
+
+---
+
+## History
+
+- **`C4:GetProxyDevices()` returns a number**, the proxy id — the documented example prints
+  `proxy is: 393`. Code that treats it as a table gets nothing, silently. This driver did until v51,
+  and so does the Frigate driver it learned from.
+- Registering types with `C4:RegisterEvents` is documented as what makes records visible in
+  Navigator. But on OS 3.4.3, records appeared in the app while registration was never actually
+  reached (because of the bug above). So registration is not strictly required there. The driver
+  registers anyway, as documented; a test checks every type that can be recorded is registered.
+- `C4:RegisterEvents` is documented as returning `true`; a shipping driver checks for `0`. Accept
+  both. It fails if the History agent starts after the driver, so retry (bounded).
+- The optional fifth (metadata) argument to `C4:RecordHistory` stopped records being stored on OS
+  3.4.3. Use the four-argument form.
+
+- **History ignores device names.** Field-verified on OS 3.4.3: every entry showed the driver's
+  definition name ("UniFi Protect Camera (Standalone)", from `<name>` in driver.xml), even after both
+  the proxy and the driver device had been renamed — `C4:GetDeviceDisplayName` confirmed the new
+  names while History kept the old label. Renaming devices cannot change it. Put the distinguishing
+  name in the History type string itself ("Person Detected · Street North - G6") and register those
+  per-camera types. Renaming the proxy is still worth doing, for Composer and Navigator.
+- Each rename refreshes the whole project on Director. Compare with `C4:GetDeviceDisplayName` first
+  and rename only on a real difference — and never in every device at the same instant.
+
+## Keeping load down
+
+- **Startup is the dangerous moment.** Every driver in the project runs `OnDriverLateInit` together.
+  Anything that calls an external API there is multiplied by the number of devices, all at once.
+  Give each instance a random slot, and do per-device work in sequence.
+- Don't fetch data at startup just to refill a UI list; it is multiplied the same way.
+- When a push channel is live, polling that duplicates it is pure cost. Slow it to what it is still
+  needed for, and make sure it cannot re-fire what the push channel delivered.
+- Parsing buffered network data by re-copying the remainder after each message is quadratic in the
+  messages per read. Parse by position and trim once.
+
+---
+
 ## Testing
 
 - **Make the stub asynchronous.** A stub that answers HTTP instantly cannot reproduce ordering bugs.
   The "No RTSP alias" race was invisible until replies were queued and delivered separately.
 - **One-shot timers must fire once.** A stub that re-fired every timer on each round turned a
   bounded retry into thousands of calls, and could equally hide a real runaway.
+- **A stub can encode your misreading.** The stub returned a table from `GetProxyDevices` because
+  that is what the driver expected. 135 tests passed; on hardware the proxy id was `nil`. Model the
+  stub on the documentation, not on the code under test.
 - **Mutation-test your tests.** Several tests here passed against broken code — a stub route that
   matched any snapshot URL returned the right frame even when the driver asked the wrong camera, on
   the wrong console. Break the code a test covers and confirm it fails.
+- **A test can go hollow.** One test here passed against broken code because the scenario never
+  actually ran: adaptive polling moved the next poll onto a timer the test was not firing. Assert
+  that the setup happened (for example, that the requests were made) as well as the outcome.
+- **Performance regressions need timing tests.** Correct-but-quadratic parsing passes every
+  correctness test. Measure both versions first and set a threshold with a wide margin.
 - **Read a working implementation early.** Most of the time lost on this project went to reasoning
   from thin documentation when a working open-source driver already had the answer.

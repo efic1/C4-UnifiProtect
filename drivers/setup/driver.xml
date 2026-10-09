@@ -70,6 +70,111 @@
         <description>RTSP is off by default in Protect for every camera. Yes lets each camera driver switch it on if it finds no stream enabled.</description>
       </property>
       <property>
+        <name>Detect Person</name>
+        <type>LIST</type>
+        <readonly>false</readonly>
+        <default>Yes</default>
+        <items><item>Yes</item><item>No</item></items>
+        <description>Pushed to every camera: fire person events and set the variable.</description>
+      </property>
+      <property>
+        <name>History - Person</name>
+        <type>LIST</type>
+        <readonly>false</readonly>
+        <default>Yes</default>
+        <items><item>Yes</item><item>No</item></items>
+        <description>Pushed to every camera: record person events in the Control4 History timeline.</description>
+      </property>
+      <property>
+        <name>Detect Vehicle</name>
+        <type>LIST</type>
+        <readonly>false</readonly>
+        <default>Yes</default>
+        <items><item>Yes</item><item>No</item></items>
+        <description>Pushed to every camera: fire vehicle events and set the variable.</description>
+      </property>
+      <property>
+        <name>History - Vehicle</name>
+        <type>LIST</type>
+        <readonly>false</readonly>
+        <default>No</default>
+        <items><item>Yes</item><item>No</item></items>
+        <description>Pushed to every camera: record vehicle events in the Control4 History timeline.</description>
+      </property>
+      <property>
+        <name>Detect Animal</name>
+        <type>LIST</type>
+        <readonly>false</readonly>
+        <default>No</default>
+        <items><item>Yes</item><item>No</item></items>
+        <description>Pushed to every camera: fire animal events and set the variable.</description>
+      </property>
+      <property>
+        <name>History - Animal</name>
+        <type>LIST</type>
+        <readonly>false</readonly>
+        <default>No</default>
+        <items><item>Yes</item><item>No</item></items>
+        <description>Pushed to every camera: record animal events in the Control4 History timeline.</description>
+      </property>
+      <property>
+        <name>Detect Package</name>
+        <type>LIST</type>
+        <readonly>false</readonly>
+        <default>No</default>
+        <items><item>Yes</item><item>No</item></items>
+        <description>Pushed to every camera: fire package events and set the variable.</description>
+      </property>
+      <property>
+        <name>History - Package</name>
+        <type>LIST</type>
+        <readonly>false</readonly>
+        <default>Yes</default>
+        <items><item>Yes</item><item>No</item></items>
+        <description>Pushed to every camera: record package events in the Control4 History timeline.</description>
+      </property>
+      <property>
+        <name>Detect Motion</name>
+        <type>LIST</type>
+        <readonly>false</readonly>
+        <default>Yes</default>
+        <items><item>Yes</item><item>No</item></items>
+        <description>Pushed to every camera: fire motion events and set the variable.</description>
+      </property>
+      <property>
+        <name>History - Motion</name>
+        <type>LIST</type>
+        <readonly>false</readonly>
+        <default>No</default>
+        <items><item>Yes</item><item>No</item></items>
+        <description>Pushed to every camera: record motion events in the Control4 History timeline.</description>
+      </property>
+      <property>
+        <name>Detect Doorbell</name>
+        <type>LIST</type>
+        <readonly>false</readonly>
+        <default>Yes</default>
+        <items><item>Yes</item><item>No</item></items>
+        <description>Pushed to every camera: fire doorbell events and set the variable.</description>
+      </property>
+      <property>
+        <name>History - Doorbell</name>
+        <type>LIST</type>
+        <readonly>false</readonly>
+        <default>Yes</default>
+        <items><item>Yes</item><item>No</item></items>
+        <description>Pushed to every camera: record doorbell events in the Control4 History timeline.</description>
+      </property>
+      <property>
+        <name>History Cooldown</name>
+        <type>RANGED_INTEGER</type>
+        <readonly>false</readonly>
+        <default>60</default>
+        <minimum>0</minimum>
+        <maximum>3600</maximum>
+        <description>Pushed to every camera: seconds before the same event type is recorded again.</description>
+      </property>
+      <property>
         <name>Cameras Found</name>
         <type>STRING</type>
         <readonly>true</readonly>

@@ -113,6 +113,12 @@ shows progress.</p>
 means eight independent listeners that cannot collide. Pushing new settings reuses each camera's
 existing listener, so the snapshot URL Navigators hold stays valid.</p>
 
+<h2>Event and History choices</h2>
+<p>The <b>Detect</b> and <b>History</b> settings on this driver are pushed to every camera by Create /
+Update Cameras and by Push Settings, so eight cameras are configured once. A push overwrites the
+same settings on each camera; to give one camera different choices, change them on that camera after
+the push.</p>
+
 <h2>Rotating the API key</h2>
 <ol>
   <li>Create the new key in UniFi OS.</li>
