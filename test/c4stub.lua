@@ -138,8 +138,13 @@ function M.new(opts)
             method = method, url = url, body = body, headers = headers or {},
         })
         local code, payload = 200, "{}"
+        local transportErr, hang = false, false
         for pattern, r in pairs(st.routes) do
             if url:find(pattern) then
+                -- { err = true }: the request fails in transport (no HTTP answer).
+                -- { hang = true }: the reply never arrives.
+                if type(r) == "table" and r.err then transportErr = true end
+                if type(r) == "table" and r.hang then hang = true end
                 -- A route may be a function of (method, url) so a test can
                 -- model state changes, e.g. RTSP switching on after a POST.
                 if type(r) == "function" then
@@ -151,9 +156,13 @@ function M.new(opts)
                 end
             end
         end
-        if onDone then
+        if onDone and not hang then
             local deliver = function()
-                onDone(self, { { code = code, body = payload, headers = {} } }, 0, "")
+                if transportErr then
+                    onDone(self, nil, 28, "Operation timed out")
+                else
+                    onDone(self, { { code = code, body = payload, headers = {} } }, 0, "")
+                end
             end
             if st.async then table.insert(st.pending, deliver) else deliver() end
         end

@@ -3,6 +3,43 @@
 Versions are the integer in each driver's `<version>`, which Composer uses to compare updates.
 Earlier development builds are summarised rather than listed individually.
 
+## Camera driver 53 / Setup driver 5
+
+A review of 52 for edge cases and controller load. Every item below was reproduced with a failing
+test first; 29 camera and 5 setup tests were added.
+
+Camera driver
+- Status no longer sticks: "Unreachable", "Auth Failed" and "API not found" clear as soon as the
+  console answers properly, and when the NVR Address or API Key changes (which also re-tests the
+  connection). Background polls need three failures in a row before showing "Unreachable".
+- Switching camera (dropdown, Camera ID, or a push from the setup driver) now goes through one
+  routine. Replies still in flight for the previous camera - stream tokens, polls, snapshot frames -
+  are ignored instead of overwriting the new camera's state, and detections held for the old camera
+  are cleared.
+- The poll chain can no longer die. An error while handling a reply is caught, and a poll that
+  never gets a reply is replaced after a minute (before, one lost reply stopped polling for good).
+- A poll reply that carries no connection state is ignored rather than read as "offline" (it fired
+  false offline/online events). A restart no longer announces "camera online".
+- Polled events: the first doorbell ring after startup is no longer swallowed; sustained motion is
+  one episode rather than one event per poll (a doorbell ring is still one event per ring).
+- Stream tokens are re-read at startup and when a camera comes back online, since Protect can change
+  them. The refresh never switches RTSP on and never blanks tokens that still work.
+- The random generator is now seeded per camera. It started from the same state on every boot, so
+  the "random" startup slot and WebSocket keys were identical across cameras.
+- Event socket: the reconnect backoff is only reset once a connection has stayed up for a minute,
+  so a console that accepts and then drops us is no longer retried every few seconds. When the
+  socket drops, the camera is polled within seconds instead of up to a minute later.
+- Snapshots: viewers that ask while a frame is being fetched wait for it instead of getting a 503;
+  a listener that is still starting is not started twice; a frame older than a minute is no longer
+  served as current; a frame fetched for the previous camera is discarded.
+
+Setup driver
+- A camera driver deleted in Composer is dropped from the managed list and added again on the next
+  sync (previously the sync kept configuring the missing device). An empty lookup result is treated
+  as a failed lookup and prunes nothing.
+- "Done" is reported when the new drivers actually exist, not when the last one was requested. A
+  step that fails, or a device that never appears, can no longer leave the sync stuck "busy".
+
 ## Camera driver 52
 
 - History entries now carry the camera's name in their title ("Person Detected · Street North -

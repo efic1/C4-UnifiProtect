@@ -1366,6 +1366,7 @@ test("each camera picks its own startup slot", function()
     local slots = {}
     for i = 1, 8 do
         local st = configured()
+        st.deviceId = 100 + i          -- every real camera has its own device id
         st.timers = {}
         OnDriverLateInit()
         for _, tm in ipairs(st.timers) do
@@ -1750,6 +1751,420 @@ end)
 test("diagnostics runs without error", function()
     local st = configured({ ["rtsps%-stream"] = { body = '{"low":"rtsps://h:7441/LOWTOK?enableSrtp"}' } })
     ExecuteCommand("LUA_ACTION", { ACTION = "Diagnostics" })
+end)
+
+--=============================================================================
+print("\nHardening review (v53)")
+--=============================================================================
+-- Each test here failed against v52 (see CHANGELOG, Camera driver 53).
+
+local CAMJSON = '{"id":"CAM1","name":"Front","state":"CONNECTED","lastMotion":1000}'
+local function cam(extra) return { body = extra } end
+
+local function configuredAsync(routes)
+    local st = stub.new({ routes = routes or {}, async = true })
+    st.load(CAM .. "driver.lua")
+    st.set("Log Mode", "Off")
+    st.set("NVR Address", "192.0.2.10")
+    st.set("API Key", "TESTKEY")
+    st.set("RTSP Alias - Low", "LOWTOK")
+    return st
+end
+
+-- Polling-mode camera: no socket, a poll every 5 s, no adaptive bursts.
+local function pollingCamera(routes, async)
+    local st = async and configuredAsync(routes) or configured(routes)
+    if async then st.set("Camera ID", "CAM1"); st.flush() end
+    st.set("Event Source", "Polling")
+    st.set("Adaptive Polling", "No")
+    st.set("Event Hold Time", "60")
+    st.set("Event Polling Interval", "5 Seconds")
+    return st
+end
+local function pollTick(st)
+    st.fireTimers(function(tm) return tm.ms == 5000 end)
+    if st.async then st.flush() end
+end
+local function countEvent(st, id)
+    local n = 0
+    for _, e in ipairs(st.events) do if e == id then n = n + 1 end end
+    return n
+end
+local function countReq(st, pat)
+    local n = 0
+    for _, r in ipairs(st.requests) do if r.url:find(pat) then n = n + 1 end end
+    return n
+end
+local function stateBody(extra)
+    return '{"id":"CAM1","name":"Front","state":"CONNECTED"' .. (extra and ("," .. extra) or "") .. '}'
+end
+
+-- ---- status that never recovered / flapped ---------------------------------
+test("one or two dropped polls do not flash Unreachable; three in a row do", function()
+    local st = pollingCamera({ ["cameras/CAM1$"] = { err = true } })
+    pollTick(st); pollTick(st)
+    truthy(not tostring(st.props["Driver Status"]):find("Unreachable"), "flapped after two: " .. tostring(st.props["Driver Status"]))
+    pollTick(st)
+    contains(st.props["Driver Status"], "Unreachable", "after three")
+end)
+
+test("Unreachable clears as soon as the console answers again", function()
+    local st = pollingCamera({ ["cameras/CAM1$"] = { err = true } })
+    for _ = 1, 3 do pollTick(st) end
+    contains(st.props["Driver Status"], "Unreachable", "precondition")
+    st.routes["cameras/CAM1$"] = cam(stateBody())
+    pollTick(st)
+    truthy(not tostring(st.props["Driver Status"]):find("Unreachable"), "stuck: " .. tostring(st.props["Driver Status"]))
+end)
+
+test("Auth Failed clears once the console accepts the key again", function()
+    -- meta/info keeps refusing; the background poll is what proves the key works.
+    local st = pollingCamera({ ["meta/info"] = { code = 401 }, ["cameras/CAM1$"] = { code = 401 } })
+    ExecuteCommand("LUA_ACTION", { ACTION = "TestConnection" })
+    contains(st.props["Driver Status"], "Auth", "precondition")
+    st.routes["cameras/CAM1$"] = cam(stateBody())
+    pollTick(st)
+    truthy(not tostring(st.props["Driver Status"]):find("Auth"), "stuck: " .. tostring(st.props["Driver Status"]))
+end)
+
+test("changing the API Key drops the old verdict before the re-test answers", function()
+    local st = configuredAsync({ ["meta/info"] = { code = 401 } })
+    st.set("Camera ID", "CAM1")
+    st.flush()
+    ExecuteCommand("LUA_ACTION", { ACTION = "TestConnection" }); st.flush()
+    contains(st.props["Driver Status"], "Auth", "precondition")
+    st.routes["meta/info"] = { hang = true }
+    st.set("API Key", "NEWKEY")
+    truthy(not tostring(st.props["Driver Status"]):find("Auth"), "old verdict kept: " .. tostring(st.props["Driver Status"]))
+end)
+
+test("changing the API Key re-tests the connection", function()
+    local st = configured({ ["meta/info"] = { body = '{"applicationVersion":"6.2.1"}' } })
+    local before = countReq(st, "meta/info")
+    st.set("API Key", "NEWKEY")
+    truthy(countReq(st, "meta/info") > before, "no test after the key changed")
+end)
+
+-- ---- replies for a camera we no longer point at ----------------------------
+local function reverseFlush(st)
+    local p = st.pending
+    st.pending = {}
+    for i = #p, 1, -1 do p[i]() end
+end
+
+test("an alias reply for the previous camera is ignored", function()
+    local st = configuredAsync({
+        ["CAMA/rtsps%-stream"] = { body = '{"low":"rtsps://h:7441/TOKA"}' },
+        ["CAMB/rtsps%-stream"] = { body = '{"low":"rtsps://h:7441/TOKB"}' },
+    })
+    st.set("Camera ID", "CAMA")
+    st.set("Camera ID", "CAMB")
+    reverseFlush(st)            -- B answers first, A's late reply lands last
+    eq(st.props["RTSP Alias - Low"], "TOKB", "the new camera's token")
+end)
+
+test("a poll reply for the previous camera is ignored", function()
+    local st = pollingCamera({
+        ["cameras/CAMA$"] = { body = '{"id":"CAMA","name":"OldName","state":"CONNECTED"}' },
+        ["cameras/CAMB$"] = { body = '{"id":"CAMB","name":"NewName","state":"CONNECTED"}' },
+    }, true)
+    st.set("Camera ID", "CAMA"); st.flush()
+    st.fireTimers(function(tm) return tm.ms == 5000 end)     -- poll for CAMA now in flight
+    st.set("Camera ID", "CAMB")                              -- switched before it answered
+    st.flush()
+    truthy(st.props["Camera Name"] ~= "OldName", "the old camera's name was applied")
+end)
+
+test("switching camera clears the old camera's token fields and held detections", function()
+    local st = pollingCamera({ ["cameras/CAM1$"] = cam(stateBody('"lastMotion":100')),
+                               ["rtsps%-stream"] = { hang = true } })     -- nothing refills them meanwhile
+    pollTick(st)
+    st.routes["cameras/CAM1$"] = cam(stateBody('"lastMotion":200'))
+    pollTick(st)
+    eq(st.vars["MOTION_DETECTED"], "true", "precondition")
+    st.set("Camera ID", "CAM2")
+    eq(st.vars["MOTION_DETECTED"], "false", "motion held over from the old camera")
+    eq(st.props["RTSP Alias - Low"], "", "token from the old camera")
+end)
+
+-- ---- the poll chain must not die -------------------------------------------
+test("a poll that never gets a reply does not stop polling for good", function()
+    local st = pollingCamera({ ["cameras/CAM1$"] = { hang = true } }, true)
+    pollTick(st)
+    eq(countReq(st, "cameras/CAM1$"), 1, "first poll sent")
+    st.routes["cameras/CAM1$"] = cam(stateBody())
+    st.fireTimers(function(tm) return tm.ms == 60000 end)    -- the watchdog
+    pollTick(st)
+    eq(countReq(st, "cameras/CAM1$"), 2, "polling resumed")
+end)
+
+test("an error while handling a reply does not stop polling", function()
+    local st = pollingCamera({ ["cameras/CAM1$"] = cam(stateBody()) }, true)
+    local real = C4.UpdateProperty
+    C4.UpdateProperty = function(self, n, v)
+        if n == "Camera Name" then error("boom") end
+        return real(self, n, v)
+    end
+    st.fireTimers(function(tm) return tm.ms == 5000 end)
+    local ok = pcall(st.flush)
+    C4.UpdateProperty = real
+    truthy(ok, "the error escaped the reply handler")
+    local live = 0
+    for _, tm in ipairs(st.timers) do
+        if tm.ms == 5000 and not tm.cancelled and not tm.fired then live = live + 1 end
+    end
+    truthy(live >= 1, "no poll scheduled after the error")
+end)
+
+-- ---- what a poll reports ---------------------------------------------------
+test("a reply without a state is not read as the camera going offline", function()
+    local st = pollingCamera({ ["cameras/CAM1$"] = cam(stateBody()) })
+    pollTick(st)
+    st.events = {}
+    st.routes["cameras/CAM1$"] = cam('{"error":"Service Unavailable"}')
+    pollTick(st)
+    eq(countEvent(st, 8), 0, "false offline event")
+    st.routes["cameras/CAM1$"] = cam(stateBody())
+    pollTick(st)
+    eq(countEvent(st, 9), 0, "false online event")
+end)
+
+test("a restart does not announce an online camera", function()
+    local st = pollingCamera({ ["cameras/CAM1$"] = cam(stateBody()) })
+    pollTick(st)
+    eq(countEvent(st, 9), 0, "online event at startup")
+end)
+
+test("a real offline then online transition still fires both", function()
+    local st = pollingCamera({ ["cameras/CAM1$"] = cam(stateBody()) })
+    pollTick(st)
+    st.routes["cameras/CAM1$"] = cam('{"id":"CAM1","state":"DISCONNECTED"}')
+    pollTick(st)
+    eq(countEvent(st, 8), 1, "offline")
+    st.routes["cameras/CAM1$"] = cam(stateBody())
+    pollTick(st)
+    eq(countEvent(st, 9), 1, "online")
+end)
+
+test("the first ring after startup is not swallowed", function()
+    local st = pollingCamera({ ["cameras/CAM1$"] = cam(stateBody('"lastRing":0')) })
+    pollTick(st)
+    st.routes["cameras/CAM1$"] = cam(stateBody('"lastRing":5000'))
+    pollTick(st)
+    eq(countEvent(st, 7), 1, "doorbell ring")
+end)
+
+test("a camera that omits the ring field still reports its first ring", function()
+    local st = pollingCamera({ ["cameras/CAM1$"] = cam(stateBody()) })
+    pollTick(st)
+    st.routes["cameras/CAM1$"] = cam(stateBody('"lastRing":5000'))
+    pollTick(st)
+    eq(countEvent(st, 7), 1, "doorbell ring")
+end)
+
+test("sustained motion seen by polling is one episode, not one event per poll", function()
+    local st = pollingCamera({ ["cameras/CAM1$"] = cam(stateBody('"lastMotion":100')) })
+    pollTick(st)
+    for ts = 200, 600, 100 do
+        st.routes["cameras/CAM1$"] = cam(stateBody('"lastMotion":' .. ts))
+        pollTick(st)
+    end
+    eq(countEvent(st, 1), 1, "motion events for one continuous movement")
+end)
+
+test("polled motion that stops and starts again is a second episode", function()
+    local st = pollingCamera({ ["cameras/CAM1$"] = cam(stateBody('"lastMotion":100')) })
+    st.set("Event Hold Time", "1")
+    pollTick(st)
+    st.routes["cameras/CAM1$"] = cam(stateBody('"lastMotion":200'))
+    pollTick(st)
+    st.fireTimers(function(tm) return tm.ms == 1000 end)     -- hold expires
+    eq(st.vars["MOTION_DETECTED"], "false", "cleared")
+    st.routes["cameras/CAM1$"] = cam(stateBody('"lastMotion":900'))
+    pollTick(st)
+    eq(countEvent(st, 1), 2, "two episodes")
+end)
+
+test("every polled doorbell ring is its own event", function()
+    local st = pollingCamera({ ["cameras/CAM1$"] = cam(stateBody('"lastRing":100')) })
+    pollTick(st)
+    for ts = 200, 300, 100 do
+        st.routes["cameras/CAM1$"] = cam(stateBody('"lastRing":' .. ts))
+        pollTick(st)
+    end
+    eq(countEvent(st, 7), 2, "rings")
+end)
+
+-- ---- stream tokens ---------------------------------------------------------
+local function storedCamera(routes)
+    local st = stub.new({ routes = routes or {} })
+    st.load(CAM .. "driver.lua")
+    for k, v in pairs({ ["Log Mode"] = "Off", ["NVR Address"] = "192.0.2.10", ["API Key"] = "K",
+        ["Camera ID"] = "CAM1", ["RTSP Alias - Low"] = "OLDTOK", ["Event Source"] = "Polling",
+        ["Event Polling Interval"] = "5 Seconds" }) do st.props[k] = v end
+    OnDriverLateInit()
+    return st
+end
+local function settle(st)
+    for _ = 1, 3 do st.fireTimers(function(tm) return not tm.repeating and tm.ms < 20000 end) end
+end
+
+test("a restart re-reads the stored stream tokens", function()
+    local st = storedCamera({
+        ["rtsps%-stream"] = { body = '{"low":"rtsps://h:7441/NEWTOK"}' },
+        ["meta/info"] = { body = '{"applicationVersion":"6.2.1"}' },
+    })
+    settle(st)
+    eq(st.props["RTSP Alias - Low"], "NEWTOK", "token after restart")
+end)
+
+test("a background refresh never switches RTSP on, nor blanks working tokens", function()
+    local st = storedCamera({ ["rtsps%-stream"] = { body = "{}" }, ["meta/info"] = { body = "{}" } })
+    settle(st)
+    for _, r in ipairs(st.requests) do
+        truthy(not (r.method == "POST" and r.url:find("rtsps%-stream")), "enabled RTSP unasked")
+    end
+    eq(st.props["RTSP Alias - Low"], "OLDTOK", "token kept")
+end)
+
+test("a camera coming back online re-reads its stream tokens", function()
+    local st = storedCamera({
+        ["cameras/CAM1$"] = cam(stateBody()),
+        ["rtsps%-stream"] = { body = '{"low":"rtsps://h:7441/OLDTOK"}' },
+        ["meta/info"] = { body = "{}" },
+    })
+    settle(st)
+    pollTick(st)
+    st.routes["cameras/CAM1$"] = cam('{"id":"CAM1","state":"DISCONNECTED"}')
+    pollTick(st)
+    local before = countReq(st, "rtsps%-stream")
+    st.routes["cameras/CAM1$"] = cam(stateBody())
+    st.routes["rtsps%-stream"] = { body = '{"low":"rtsps://h:7441/REBOOTED"}' }
+    pollTick(st)
+    truthy(countReq(st, "rtsps%-stream") > before, "no token refresh on return")
+    eq(st.props["RTSP Alias - Low"], "REBOOTED", "new token")
+end)
+
+test("a refresh that finds RTSP switched off does not switch it back on", function()
+    local st = storedCamera({ ["rtsps%-stream"] = { code = 404 }, ["meta/info"] = { body = "{}" } })
+    settle(st)
+    for _, r in ipairs(st.requests) do
+        truthy(not (r.method == "POST" and r.url:find("rtsps%-stream")), "enabled RTSP unasked")
+    end
+end)
+
+-- ---- randomness ------------------------------------------------------------
+test("the random generator is seeded differently per camera", function()
+    local seeds = {}
+    local real = math.randomseed
+    for _, id in ipairs({ 100, 101 }) do
+        local st = configured()
+        st.deviceId = id
+        math.randomseed = function(x) seeds[id] = x end
+        OnDriverLateInit()
+    end
+    math.randomseed = real
+    truthy(seeds[100] and seeds[101], "never seeded")
+    truthy(seeds[100] ~= seeds[101], "two cameras booting together share a seed")
+end)
+
+-- ---- event socket ----------------------------------------------------------
+local function delayOf(st) return tonumber(tostring(st.props["Event Stream"]):match("in (%d+)s")) end
+local function dropAndReconnect(st)
+    OnConnectionStatusChanged(6001, 443, "OFFLINE")
+    local d = delayOf(st)
+    st.fireTimers(function(tm) return tm.ms == d * 1000 end)
+    OnConnectionStatusChanged(6001, 443, "ONLINE")
+    ReceivedFromNetwork(6001, 443, HANDSHAKE_OK)
+    return d
+end
+
+test("a server that accepts and drops us backs off instead of being hammered", function()
+    local st = liveSocket()
+    local d
+    for _ = 1, 4 do d = dropAndReconnect(st) end
+    truthy(d >= 8, "backoff reset by each handshake; last delay " .. tostring(d))
+end)
+
+test("a connection that stayed up starts the backoff over", function()
+    local st = liveSocket()
+    for _ = 1, 3 do dropAndReconnect(st) end
+    local real = os.time
+    os.time = function() return real() + 300 end
+    OnConnectionStatusChanged(6001, 443, "OFFLINE")
+    os.time = real
+    truthy(delayOf(st) <= 4, "stable connection should reset; delay " .. tostring(delayOf(st)))
+end)
+
+test("when the socket drops, the camera is polled soon, not a minute later", function()
+    local st = liveSocket()
+    st.set("Event Polling Interval", "5 Seconds")           -- socket up: timer stretched to 60 s
+    local before = countReq(st, "cameras/CAM1$")
+    OnConnectionStatusChanged(6001, 443, "OFFLINE")
+    st.fireTimers(function(tm) return tm.ms < 5000 and tm.ms >= 1000 and not tm.repeating end)
+    truthy(countReq(st, "cameras/CAM1$") > before, "no catch-up poll")
+end)
+
+-- ---- snapshot listener -----------------------------------------------------
+local function snapCamera(routes, async)
+    local st = async and configuredAsync(routes) or configured(routes)
+    if async then st.set("Camera ID", "CAM1"); st.flush() end
+    st.set("Snapshots", "On")
+    OnServerStatusChanged(53319, "ONLINE", "snapshot")
+    local sent = {}
+    C4.ServerSend = function(self, h, data) table.insert(sent, data) end
+    return st, sent
+end
+local GETSNAP = "GET /snapshot.jpg HTTP/1.1\r\n\r\n"
+
+test("two viewers asking at once both get the frame", function()
+    local st, sent = snapCamera({ ["/snapshot"] = { body = "FRAMEDATA" } }, true)
+    OnServerDataIn(1, GETSNAP, "1.1.1.1", 5000, "snapshot")
+    OnServerDataIn(2, GETSNAP, "1.1.1.1", 5000, "snapshot")
+    st.flush()
+    eq(#sent, 2, "both answered")
+    for _, r in ipairs(sent) do contains(r, "200 OK", "response") end
+end)
+
+test("a listener still starting is not started twice", function()
+    local st = configured()
+    st.set("Snapshots", "On")                  -- listener requested, not yet ONLINE
+    ExecuteCommand("SET_PROTECT_CONFIG", { address = "192.0.2.10", api_key = "TESTKEY",
+        camera_id = "CAM1", snapshots = "On" })
+    eq(#st.servers, 1, "listeners created")
+end)
+
+test("a frame older than a minute is not served as current", function()
+    local st, sent = snapCamera({ ["/snapshot"] = { body = "FRAMEDATA" } })
+    local real, now = os.time, os.time()
+    os.time = function() return now end
+    OnServerDataIn(1, GETSNAP, "1.1.1.1", 5000, "snapshot")
+    contains(sent[#sent], "200 OK", "first fetch")
+    st.routes["/snapshot"] = { code = 500 }
+    now = now + 30
+    OnServerDataIn(1, GETSNAP, "1.1.1.1", 5000, "snapshot")
+    contains(sent[#sent], "200 OK", "a 30 s old frame beats nothing")
+    now = now + 120
+    OnServerDataIn(1, GETSNAP, "1.1.1.1", 5000, "snapshot")
+    os.time = real
+    contains(sent[#sent], "503", "a stale frame must not pass as current")
+end)
+
+test("a frame fetched for the previous camera is discarded", function()
+    local st, sent = snapCamera({
+        ["CAMOLD/snapshot"] = { body = "OLDFRAME" },
+        ["CAMNEW/snapshot"] = { body = "NEWFRAME" },
+    }, true)
+    st.set("Camera ID", "CAMOLD"); st.flush()
+    OnServerDataIn(1, GETSNAP, "1.1.1.1", 5000, "snapshot")      -- old fetch in flight
+    st.set("Camera ID", "CAMNEW")
+    OnServerDataIn(2, GETSNAP, "1.1.1.1", 5000, "snapshot")      -- new fetch
+    reverseFlush(st)                                              -- new lands first, old last
+    sent = {}
+    C4.ServerSend = function(self, h, data) table.insert(sent, data) end
+    OnServerDataIn(3, GETSNAP, "1.1.1.1", 5000, "snapshot")
+    st.flush()
+    contains(sent[#sent] or "", "NEWFRAME", "served from cache")
 end)
 
 --=============================================================================

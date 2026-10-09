@@ -225,7 +225,8 @@ test("the rest follow at spaced intervals", function()
     local st = setup()
     ExecuteCommand("LUA_ACTION", { ACTION = "SyncCameras" })
     local delays = {}
-    for _, tm in ipairs(st.timers) do table.insert(delays, tm.ms) end
+    -- (the 30s+ timer is the sync's safety net, not a pacing timer)
+    for _, tm in ipairs(st.timers) do if tm.ms < 20000 then table.insert(delays, tm.ms) end end
     table.sort(delays)
     eq(#delays, 2, "two cameras deferred")
     truthy(delays[1] >= 2000, "first deferral at least 2s, got " .. delays[1])
@@ -257,6 +258,78 @@ test("a sync cannot be started while one is running", function()
     ExecuteCommand("LUA_ACTION", { ACTION = "SyncCameras" })
     drain(st)
     eq(#st.added, 3, "no duplicates from a double press")
+end)
+
+
+print("\nSync robustness (v5)")
+
+-- A camera driver deleted in Composer left its id in the managed list: the
+-- sync kept configuring a device that no longer exists and never replaced it.
+test("a managed camera whose driver was deleted is added again", function()
+    local st = setup({ existing = { [301] = 301 } })
+    st.persist["managed_cameras"] = { C1 = 300, C2 = 301 }
+    ExecuteCommand("LUA_ACTION", { ACTION = "SyncCameras" })
+    drain(st)
+    local names = {}
+    for _, a in ipairs(st.added) do names[a.name] = true end
+    truthy(names["Front Door - G5"], "C1 was not re-added")
+    truthy(not names["Pool"], "C2 still exists and must not be duplicated")
+    eq(st.persist["managed_cameras"].C2, 301, "surviving camera kept")
+    truthy(st.persist["managed_cameras"].C1 ~= 300, "dead id still recorded")
+end)
+
+test("an empty device lookup does not wipe the managed list", function()
+    local st = setup({ existing = {} })
+    st.persist["managed_cameras"] = { C1 = 300 }
+    ExecuteCommand("LUA_ACTION", { ACTION = "SyncCameras" })
+    drain(st)
+    local names = {}
+    for _, a in ipairs(st.added) do names[a.name] = true end
+    truthy(not names["Front Door - G5"], "C1 re-added because the lookup came back empty")
+end)
+
+local function pacing(st) st.fireTimers(function(tm) return tm.ms < 20000 end) end
+
+test("Done is reported only after the drivers really exist", function()
+    local st = setup()
+    local callbacks = {}
+    C4.AddDevice = function(self, file, room, name, cb)
+        st.nextDeviceId = st.nextDeviceId + 1
+        table.insert(st.added, { file = file, room = room, name = name, id = st.nextDeviceId })
+        table.insert(callbacks, { id = st.nextDeviceId, cb = cb })
+        return st.nextDeviceId
+    end
+    ExecuteCommand("LUA_ACTION", { ACTION = "SyncCameras" })
+    pacing(st); pacing(st)
+    eq(#callbacks, 3, "all three adds requested")
+    truthy(not tostring(st.props["Setup Status"]):find("Done"), "Done before any device exists")
+    for _, c in ipairs(callbacks) do c.cb(c.id) end
+    contains(st.props["Setup Status"], "Done", "after the devices exist")
+end)
+
+test("a sync whose device never appears is released, not stuck forever", function()
+    local st = setup()
+    C4.AddDevice = function(self, file, room, name, cb)
+        st.nextDeviceId = st.nextDeviceId + 1
+        table.insert(st.added, { name = name })
+        return st.nextDeviceId                     -- the callback never comes
+    end
+    ExecuteCommand("LUA_ACTION", { ACTION = "SyncCameras" })
+    pacing(st); pacing(st)
+    truthy(not tostring(st.props["Setup Status"]):find("Done"), "precondition")
+    st.fireTimers(function(tm) return tm.ms >= 20000 end)     -- the safety timer
+    contains(st.props["Setup Status"], "Done", "released")
+    local n = #st.added
+    ExecuteCommand("LUA_ACTION", { ACTION = "SyncCameras" })
+    truthy(#st.added > n, "a new sync could not start")
+end)
+
+test("a step that throws does not wedge the sync", function()
+    local st = setup()
+    C4.AddDevice = function() error("composer said no") end
+    ExecuteCommand("LUA_ACTION", { ACTION = "SyncCameras" })
+    pacing(st); pacing(st)
+    contains(st.props["Setup Status"], "Done", "sync finished despite the errors")
 end)
 
 print("\nFailure handling")
