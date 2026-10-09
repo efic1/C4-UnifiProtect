@@ -13,7 +13,7 @@
 --]]
 
 -- Must equal <version> in driver.xml; the build refuses to package otherwise.
-local DRIVER_VERSION = "48"
+local DRIVER_VERSION = "53"
 local CAMERA_BINDING = 5001
 
 --=============================================================================

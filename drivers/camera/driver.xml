@@ -6,7 +6,7 @@
   <model>UniFi Protect Camera</model>
   <created>09/10/2026</created>
   <modified>10/09/2026</modified>
-  <version>48</version>
+  <version>53</version>
   <small>devices_sm/camera.gif</small>
   <large>devices_lg/camera.gif</large>
   <control>lua_gen</control>
