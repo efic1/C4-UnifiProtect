@@ -13,7 +13,7 @@
 --]]
 
 -- Must equal <version> in driver.xml; the build refuses to package otherwise.
-local DRIVER_VERSION = "46"
+local DRIVER_VERSION = "47"
 local CAMERA_BINDING = 5001
 
 --=============================================================================
@@ -31,7 +31,7 @@ local g = {
     detect         = { person = true, vehicle = true, animal = false, package = false },
     logMode        = "Off",
     logLevel       = 2,
-    online         = false,   -- camera connection state, from polling
+    online         = nil,     -- camera connection state; nil until the first valid poll
     pollTimer      = nil,
     pollBusy       = false,
     adaptive       = true,
@@ -67,6 +67,14 @@ local g = {
     reaperTimer    = nil,
     httpPort       = 443,
     cameraMap      = {},   -- display name -> Protect camera id
+    gen            = 0,    -- bumps whenever the camera changes; replies for an older value are dropped
+    pollSeq        = 0,    -- identifies the poll whose reply is still wanted
+    pollStartedAt  = nil,
+    pollWatch      = nil,  -- timer that abandons a poll whose reply never arrives
+    active         = {},   -- event kind -> true while its variable is set
+    failStreak     = 0,    -- consecutive transport failures
+    serverPending  = false, -- CreateServer called, ONLINE not yet reported
+    snapWaiters    = {},   -- callbacks waiting on the snapshot fetch in flight
 }
 
 local QUALITY_ORDER = { "Low", "Medium", "High" }
@@ -273,10 +281,20 @@ local function request(method, path, body, cb, quiet, attempt)
             if errCode ~= 0 and code == 0 then
                 log(LVL.ERROR, "Transport error on %s: [%s] %s",
                     path, tostring(errCode), tostring(errMsg))
-                g.unreachable = true
+                -- The event poll runs continuously: one timeout is not
+                -- "unreachable". Require a short streak from quiet callers.
+                g.failStreak = (g.failStreak or 0) + 1
+                if not quiet or g.failStreak >= 3 then g.unreachable = true end
                 computeStatus()
                 if cb then cb(false, nil, 0, errMsg) end
                 return
+            end
+
+            -- Any HTTP answer proves the console is reachable again.
+            g.failStreak = 0
+            if g.unreachable then
+                g.unreachable = false
+                computeStatus()
             end
 
             if code == 429 then
@@ -337,6 +355,13 @@ local function request(method, path, body, cb, quiet, attempt)
                 log(LVL.DEBUG, "Body: %s", tostring(raw):sub(1, 300))
                 if cb then cb(false, nil, code, raw) end
                 return
+            end
+
+            -- A 2xx proves the key is valid and the API is present, whatever
+            -- an earlier failure said.
+            if g.authFailed or g.connError then
+                g.authFailed, g.connError = false, nil
+                computeStatus()
             end
 
             log(LVL.TRACE, "HTTP %d body: %s", code, tostring(raw):sub(1, 500))
@@ -734,6 +759,7 @@ end
 local SNAP_FRESH_SEC  = 5          -- serve from cache below this age
 local SNAP_IDLE_SEC   = 120        -- release the cached frame after this quiet
 local MAX_SNAP_BYTES  = 4 * 1024 * 1024
+local SNAP_MAX_STALE_SEC = 60      -- never serve a frame older than this, even if fetches fail
 
 local function snapshotReady()
     return g.snapshots and g.serverPort and g.controllerIp and g.controllerIp ~= ""
@@ -744,13 +770,24 @@ local function snapshotUrl()
     return string.format("http://%s:%d/snapshot.jpg", g.controllerIp, g.serverPort)
 end
 
+-- Releases everyone waiting on the fetch in flight. Requests that arrive
+-- while a fetch is running wait for it; they used to be turned away with a
+-- 503 when the cache was empty.
+local function flushSnapWaiters(ok)
+    local waiters = g.snapWaiters
+    g.snapWaiters = {}
+    for _, f in ipairs(waiters) do pcall(f, ok) end
+end
+
 local function refreshSnapshot(cb)
     if g.cameraId == "" or g.address == "" or g.apiKey == "" then
         if cb then cb(false) end
         return
     end
-    if g.snapFetching then if cb then cb(false) end return end
+    if cb then g.snapWaiters[#g.snapWaiters + 1] = cb end
+    if g.snapFetching then return end
     g.snapFetching = true
+    local gen = g.gen
 
     -- Only highQuality is supported here. Adding w= returns HTTP 400.
     local path = string.format("/proxy/protect/integration/v1/cameras/%s/snapshot?highQuality=false",
@@ -760,6 +797,9 @@ local function refreshSnapshot(cb)
     log(LVL.INFO, "Snapshot fetch: %s", fullUrl)
     C4:url()
         :OnDone(function(transfer, responses, errCode, errMsg)
+            -- The camera changed while this was in flight. setCameraId already
+            -- released the waiters; this frame belongs to the old camera.
+            if gen ~= g.gen then return end
             g.snapFetching = false
             local resp = responses and responses[#responses]
             local code = resp and resp.code or 0
@@ -771,7 +811,7 @@ local function refreshSnapshot(cb)
                     C4:UpdateProperty("Snapshot Status", "Active on port " .. tostring(g.serverPort))
                     log(LVL.INFO, "Snapshot OK: %d bytes from %s", #body, fullUrl)
                 end
-                if cb then cb(true) end
+                flushSnapWaiters(true)
             else
                 if g.snapState ~= "fail" then
                     g.snapState = "fail"
@@ -787,7 +827,7 @@ local function refreshSnapshot(cb)
                     end
                     log(LVL.WARN, "  camera id: %s", g.cameraId)
                 end
-                if cb then cb(false) end
+                flushSnapWaiters(false)
             end
         end)
         :SetOption("ssl_verify_peer", false)
@@ -806,8 +846,14 @@ local function httpReply(handle, status, ctype, body)
 end
 
 function OnServerStatusChanged(port, status, identifier)
+    g.serverPending = false
     if status ~= "ONLINE" then
         g.serverPort = nil
+        return
+    end
+    if not g.snapshots then
+        -- Switched off while the listener was still starting.
+        C4:DestroyServer(port)
         return
     end
     g.serverPort = port
@@ -845,9 +891,13 @@ function OnServerDataIn(handle, data, address, port, identifier)
         httpReply(handle, "200 OK", "image/jpeg", g.snapData)
         return
     end
-    refreshSnapshot(function()
-        if g.snapData then
-            httpReply(handle, "200 OK", "image/jpeg", g.snapData)   -- stale beats blank
+    refreshSnapshot(function(ok)
+        -- A recent frame beats a blank tile, but not one that has been
+        -- failing to refresh for a minute: that would hide an outage.
+        local usable = ok or (g.snapData and g.snapTime
+            and (os.time() - g.snapTime) <= SNAP_MAX_STALE_SEC)
+        if usable and g.snapData then
+            httpReply(handle, "200 OK", "image/jpeg", g.snapData)
         else
             httpReply(handle, "503 Service Unavailable", "text/plain", "no snapshot")
         end
@@ -859,7 +909,7 @@ local function ensureSnapshotServer()
         if g.serverPort then startSnapshotServer() end   -- tears it down
         return
     end
-    if g.serverPort then
+    if g.serverPort or g.serverPending then
         -- Same listener, same port: just discard the frame from the old camera.
         -- The next request fetches from the new one.
         g.snapData, g.snapTime, g.snapState = nil, nil, nil
@@ -869,6 +919,10 @@ local function ensureSnapshotServer()
 end
 
 function startSnapshotServer()
+    -- A listener is already starting and will report its port. Creating a
+    -- second one here would orphan the first: its port is not known yet, so
+    -- it could never be destroyed.
+    if g.snapshots and g.serverPending then return end
     if g.serverPort then C4:DestroyServer(g.serverPort); g.serverPort = nil end
     if g.reaperTimer then g.reaperTimer:Cancel(); g.reaperTimer = nil end
     g.snapData, g.snapTime, g.snapState = nil, nil, nil
@@ -885,6 +939,7 @@ function startSnapshotServer()
         C4:UpdateProperty("Snapshot Status", "Listener failed")
         return
     end
+    g.serverPending = true
     -- Release the cached frame for a camera nobody is looking at.
     g.reaperTimer = C4:SetTimer(60000, function()
         if g.snapData and g.lastServe and (os.time() - g.lastServe) > SNAP_IDLE_SEC then
@@ -948,7 +1003,8 @@ local EVENT_MAP = {
     vehicle  = { var = "VEHICLE_DETECTED",  event = 4 },
     animal   = { var = "ANIMAL_DETECTED",   event = 5 },
     package  = { var = "PACKAGE_DETECTED",  event = 6 },
-    doorbell = { var = "DOORBELL_RING",     event = 7 },
+    -- A ring is a discrete act: every ring fires, even inside the hold window.
+    doorbell = { var = "DOORBELL_RING",     event = 7, discrete = true },
 }
 
 local function clearEvent(kind)
@@ -956,9 +1012,8 @@ local function clearEvent(kind)
     if not m then return end
     C4:SetVariable(m.var, "false")
     if m.endEvent then C4:FireEvent(m.endEvent) end
-    if g.holdTimers[kind] then
-        g.holdTimers[kind] = nil
-    end
+    g.active[kind] = nil
+    g.holdTimers[kind] = nil
     log(LVL.DEBUG, "Cleared %s", kind)
 end
 
@@ -972,8 +1027,16 @@ local function fireEvent(kind)
     -- Activity rarely arrives alone: poll quickly for a short window so the
     -- follow-up detections and the end-of-event are caught promptly.
     if g.adaptive then g.fastUntil = os.time() + g.burstSeconds end
-    C4:SetVariable(m.var, "true")
-    C4:FireEvent(m.event)
+
+    -- Protect keeps advancing its timestamps for as long as activity lasts.
+    -- Fire the event once per episode, not once per poll: every FireEvent
+    -- makes Director re-evaluate the project's programming. Further activity
+    -- only extends the hold window below.
+    if m.discrete or not g.active[kind] then
+        g.active[kind] = true
+        C4:SetVariable(m.var, "true")
+        C4:FireEvent(m.event)
+    end
 
     -- Per-event watchdog. A shared timer would clear unrelated state.
     if g.holdTimers[kind] then g.holdTimers[kind]:Cancel() end
@@ -985,29 +1048,53 @@ end
 local function handleCameraState(cam)
     if type(cam) ~= "table" then return end
 
-    if cam.name and cam.name ~= "" then
+    -- A reply with no connection state is truncated, or not a camera object.
+    -- Acting on it would report the camera offline and then online again, and
+    -- would record a bogus baseline timestamp.
+    if cam.state == nil and cam.isConnected == nil then
+        log(LVL.TRACE, "Camera reply has no connection state; ignored")
+        return
+    end
+
+    if type(cam.name) == "string" and cam.name ~= "" then
         C4:UpdateProperty("Camera Name", cam.name)
     end
 
     local isOnline = (cam.state == "CONNECTED") or (cam.isConnected == true)
-    if isOnline ~= g.online then
+    if g.online == nil then
+        -- First valid reply since load or a camera change: record the state,
+        -- but do not announce it. Otherwise every restart fires "online".
+        g.online = isOnline
+        g.cameraOffline = not isOnline
+        computeStatus()
+    elseif isOnline ~= g.online then
         g.online = isOnline
         C4:FireEvent(isOnline and 9 or 8)
         g.cameraOffline = not isOnline
         computeStatus()
         log(LVL.INFO, "Camera %s", isOnline and "online" or "offline")
+        -- Stream tokens can change while a camera is away (RTSP toggled,
+        -- Protect updated). Re-read them, but never auto-enable.
+        if isOnline and g.cameraId ~= "" and g.aliasState ~= "pending"
+           and g.aliasState ~= "enabling" then
+            fetchAliases(true)
+        end
     end
 
-    -- Timestamps are epoch milliseconds. Fire only when they advance.
+    -- Timestamps are epoch milliseconds. The first valid reply is a baseline
+    -- even when the field is 0 or absent (a doorbell that has never rung);
+    -- otherwise the first real event after load would be taken for the
+    -- baseline and silently dropped.
     local function checkStamp(key, kind, enabled)
-        local ts = cam[key]
-        if type(ts) ~= "number" or ts == 0 then return end
         if enabled == false then return end
-        if g.lastSeen[kind] and ts <= g.lastSeen[kind] then return end
-        local first = (g.lastSeen[kind] == nil)
-        g.lastSeen[kind] = ts
-        -- Don't replay history on the first poll after a driver restart.
-        if not first then fireEvent(kind) end
+        local ts = type(cam[key]) == "number" and cam[key] or 0
+        local seen = g.lastSeen[kind]
+        if seen == nil then
+            g.lastSeen[kind] = ts        -- baseline; never replay history
+        elseif ts > seen then
+            g.lastSeen[kind] = ts
+            fireEvent(kind)
+        end
     end
 
     checkStamp("lastMotion", "motion", true)
@@ -1020,11 +1107,16 @@ local function handleCameraState(cam)
     -- bootstrap; unrecognised shapes are logged at Trace and ignored.
     local ts = cam.lastSmartDetect or cam.lastSmartDetectAt
     local types = cam.lastSmartDetectTypes or cam.smartDetectTypes
-    if type(ts) == "number" and ts > 0 and type(types) == "table" then
-        local advanced = not (g.lastSeen.smart and ts <= g.lastSeen.smart)
-        local first = (g.lastSeen.smart == nil)
-        g.lastSeen.smart = ts
-        if advanced and not first then
+    local tsn = type(ts) == "number" and ts or 0
+    if g.lastSeen.smart == nil then
+        g.lastSeen.smart = tsn
+        if tsn > 0 and type(types) ~= "table" then
+            log(LVL.WARN, "Smart detections present but no type list found - " ..
+                "person/vehicle/animal/package events will not fire. Raise Log Level to Trace and report the payload shape.")
+        end
+    elseif tsn > g.lastSeen.smart then
+        g.lastSeen.smart = tsn
+        if type(types) == "table" then
             for _, t in ipairs(types) do
                 local kind = tostring(t):lower()
                 if kind == "person" and g.detect.person then fireEvent("person")
@@ -1034,22 +1126,18 @@ local function handleCameraState(cam)
                 else log(LVL.TRACE, "Smart detect class not handled: %s", kind) end
             end
         end
-    elseif type(ts) == "number" and ts > 0 and g.lastSeen.smart == nil then
-        log(LVL.WARN, "Smart detections present but no type list found - " ..
-            "person/vehicle/animal/package events will not fire. Raise Log Level to Trace and report the payload shape.")
-        g.lastSeen.smart = ts
     end
 end
 
 -- Self-scheduling poll. A repeating timer can stack requests if the console
 -- is slow to answer; this chains one-shot timers and skips a tick while a
 -- request is still in flight.
-local function schedulePoll()
+local function schedulePoll(delayOverride)
     if g.pollTimer then g.pollTimer:Cancel(); g.pollTimer = nil end
     if g.pollInterval == 0 then return end
 
-    local delay = g.pollInterval
-    if g.adaptive and g.fastUntil and os.time() < g.fastUntil then
+    local delay = delayOverride or g.pollInterval
+    if not delayOverride and g.adaptive and g.fastUntil and os.time() < g.fastUntil then
         delay = 1000
     end
 
@@ -1058,6 +1146,8 @@ local function schedulePoll()
         pcall(poll)
     end)
 end
+
+local POLL_STALL_SEC = 60
 
 function poll()
     if g.cameraId == "" or g.address == "" then
@@ -1070,19 +1160,45 @@ function poll()
         return
     end
     g.pollBusy = true
+    g.pollStartedAt = os.time()
+    local seq = g.pollSeq + 1
+    g.pollSeq = seq
+
+    -- Watchdog. The next tick is only scheduled when a reply arrives, so a
+    -- reply that never comes (OnDone not delivered) would otherwise end
+    -- polling silently.
+    if g.pollWatch then g.pollWatch:Cancel() end
+    g.pollWatch = C4:SetTimer(POLL_STALL_SEC * 1000, function()
+        g.pollWatch = nil
+        if g.pollSeq == seq and g.pollBusy then
+            log(LVL.WARN, "No reply to the event poll for %ds; abandoning it", POLL_STALL_SEC)
+            g.pollSeq = g.pollSeq + 1      -- a late reply is now ignored
+            g.pollBusy, g.pollStartedAt = false, nil
+            schedulePoll()
+        end
+    end)
 
     ensureSession(function(ok)
         if not ok then
-            g.pollBusy = false
+            if g.pollWatch then g.pollWatch:Cancel(); g.pollWatch = nil end
+            g.pollBusy, g.pollStartedAt = false, nil
             schedulePoll()
             return
         end
         request("GET", basePath() .. "/cameras/" .. g.cameraId, nil,
             function(success, data, code)
-                g.pollBusy = false
+                -- Superseded: the camera changed, or the watchdog gave up on
+                -- this poll. A new chain owns the schedule now.
+                if seq ~= g.pollSeq then return end
+                if g.pollWatch then g.pollWatch:Cancel(); g.pollWatch = nil end
+                g.pollBusy, g.pollStartedAt = false, nil
                 if success then
-                    handleCameraState(data)
-                elseif code == 401 then
+                    -- An error here must not end the chain: the next tick is
+                    -- only scheduled below.
+                    local handled, err = pcall(handleCameraState, data)
+                    if not handled then
+                        log(LVL.ERROR, "Event handling failed: %s", tostring(err))
+                    end
                 end
                 schedulePoll()
             end, true)   -- quiet: this runs continuously
@@ -1102,7 +1218,42 @@ local function startPolling()
     if g.adaptive then note = note .. " (bursts to 3600 briefly after an event)" end
     C4:UpdateProperty("API Call Rate", note)
     log(LVL.INFO, "Polling every %dms - about %s", g.pollInterval, note)
-    schedulePoll()
+    -- Every camera driver on the controller starts together; spread the first
+    -- poll so they do not all hit the console in the same instant.
+    schedulePoll(math.random(250, math.min(g.pollInterval, 5000)))
+end
+
+-- Polling needs a console, a key and a camera. It does not need stream
+-- aliases (events work without RTSP). Called after anything that can complete
+-- that set, so a camera configured after load starts polling without a reload.
+local function ensurePolling()
+    if g.initializing or g.pollInterval == 0 then return end
+    if g.address == "" or g.apiKey == "" or g.cameraId == "" then return end
+    if g.pollTimer or g.pollBusy then return end
+    startPolling()
+end
+
+-- Every place that changes camera must reset the same state, and must make
+-- replies to requests issued for the OLD camera harmless: an alias reply for
+-- the previous camera used to overwrite the new camera's stream token.
+local function setCameraId(id)
+    g.cameraId = id
+    g.gen = g.gen + 1
+    g.pollSeq = g.pollSeq + 1
+    if g.pollTimer then g.pollTimer:Cancel(); g.pollTimer = nil end
+    g.pollBusy, g.pollStartedAt = false, nil
+    if g.pollWatch then g.pollWatch:Cancel(); g.pollWatch = nil end
+    g.rtspEnableTried = false
+    g.lastSeen, g.active = {}, {}
+    g.online, g.cameraOffline = nil, false
+    g.aliasState = "idle"
+    g.aliases = { Low = "", Medium = "", High = "" }
+    for _, q in ipairs(QUALITY_ORDER) do
+        C4:UpdateProperty("RTSP Alias - " .. q, "")
+    end
+    -- The cached frame and any fetch in flight belong to the old camera.
+    g.snapData, g.snapTime, g.snapFetching = nil, nil, false
+    flushSnapWaiters(false)
 end
 
 --=============================================================================
@@ -1241,8 +1392,8 @@ local function afterStreams()
 end
 
 -- No quality has RTSP enabled. Turn it on once if allowed, else say so.
-local function noStreamsFound()
-    if g.autoEnableRtsp and not g.rtspEnableTried then
+local function noStreamsFound(noEnable)
+    if g.autoEnableRtsp and not g.rtspEnableTried and not noEnable then
         g.rtspEnableTried = true
         log(LVL.INFO, "No RTSP stream is enabled for this camera - enabling it in Protect")
         enableRtspStreams()
@@ -1256,14 +1407,20 @@ end
 
 -- Integration API: GET /cameras/{id}/rtsps-stream returns quality -> rtsps://
 -- URL. Qualities that are not enabled are absent or null.
-local function fetchAliasesIntegration()
-    g.aliasState = "pending"
-    computeStatus()
+-- refresh=true: re-reading tokens we already hold. Quiet about it, and never
+-- turns RTSP on in Protect as a side effect.
+local function fetchAliasesIntegration(refresh)
+    if not refresh then
+        g.aliasState = "pending"
+        computeStatus()
+    end
+    local gen = g.gen
     request("GET", basePath() .. "/cameras/" .. g.cameraId .. "/rtsps-stream", nil,
         function(success, data, code, raw)
+            if gen ~= g.gen then return end   -- reply for a camera we have left
             if not success then
                 if code == 404 then
-                    noStreamsFound()           -- RTSP off, or the API is missing
+                    noStreamsFound(refresh)    -- RTSP off, or the API is missing
                 elseif code == 429 then
                     -- Retries exhausted. Do NOT follow up with another request
                     -- to a console that is already refusing them.
@@ -1300,7 +1457,7 @@ local function fetchAliasesIntegration()
             end
 
             if found == 0 then
-                noStreamsFound()
+                noStreamsFound(refresh)
             else
                 -- This branch used to leave the status untouched, so an earlier
                 -- "No RTSP alias" outlived the aliases arriving.
@@ -1313,14 +1470,14 @@ local function fetchAliasesIntegration()
         end)
 end
 
-function fetchAliases()
+function fetchAliases(refresh)
     if g.cameraId == "" then
         log(LVL.ERROR, "Select a camera before fetching aliases")
         return
     end
     ensureSession(function(ok)
         if not ok then return end
-        fetchAliasesIntegration()
+        fetchAliasesIntegration(refresh)
     end)
 end
 
@@ -1399,8 +1556,10 @@ function enableRtspStreams()
         g.aliasState = "enabling"
         computeStatus()
         local body = '{"qualities":["high","medium","low"]}'
+        local gen = g.gen
         request("POST", basePath() .. "/cameras/" .. g.cameraId .. "/rtsps-stream", body,
             function(success, data, code, raw)
+                if gen ~= g.gen then return end   -- camera changed meanwhile
                 if not success then
                     log(LVL.ERROR, "Could not enable RTSP (HTTP %s): %s",
                         tostring(code), tostring(raw):sub(1, 200))
@@ -1441,14 +1600,12 @@ local function applyConfig(t)
 
     local newCam = t.camera_id and tostring(t.camera_id) or nil
     if newCam and newCam ~= g.cameraId then
-        g.cameraId = newCam
-        g.rtspEnableTried = false
-        g.lastSeen = {}
-        g.aliases = { Low = "", Medium = "", High = "" }
-        for _, q in ipairs({ "Low", "Medium", "High" }) do
-            C4:UpdateProperty("RTSP Alias - " .. q, "")
-        end
+        setCameraId(newCam)
         changed["Camera ID"] = true
+    end
+    -- New connection details invalidate what the status said about the old.
+    if changed["NVR Address"] or changed["API Key"] then
+        g.authFailed, g.unreachable, g.connError, g.failStreak = false, false, nil, 0
     end
     if newCam then C4:UpdateProperty("Camera ID", newCam) end
 
@@ -1483,6 +1640,9 @@ local function applyConfig(t)
     -- The snapshot server reads g.address / g.apiKey / g.cameraId at fetch
     -- time, so it must run after those are set. It keeps its port.
     ensureSnapshotServer()
+    -- Events need only address, key and camera. Without this a camera
+    -- configured by the setup driver would not poll until the next reload.
+    ensurePolling()
     -- No separate connection test here. The stream fetch above already
     -- proves the console answers; firing both at once, on every camera at
     -- once, is what tripped Protect's rate limit (HTTP 429). The version for
@@ -1575,6 +1735,15 @@ local function trim(s)
     return (tostring(s or ""):gsub("^%s*(.-)%s*$", "%1"))
 end
 
+-- A new address or key invalidates whatever the status said about the old
+-- one: "Auth Failed" used to outlive the fix. Re-test (unless loading) so the
+-- status reflects the new values.
+local function connectionSettingsChanged()
+    g.authFailed, g.unreachable, g.connError, g.failStreak = false, false, nil, 0
+    if g.initializing then return end
+    if g.address ~= "" and g.apiKey ~= "" then testConnection() end
+end
+
 -- Accepts a bare token or a full rtsps:// URL pasted from the Protect UI.
 local function cleanAlias(v)
     v = trim(v)
@@ -1590,8 +1759,10 @@ function OnPropertyChanged(name)
     if name == "NVR Address" then
         g.address = trim(v)
         pushAddressToProxy()
+        connectionSettingsChanged()
     elseif name == "API Key" then
         g.apiKey = trim(v)
+        connectionSettingsChanged()
     elseif name == "Camera" then
         if g.initializing then return end   -- the map is not built yet
         local id = g.cameraMap[v]
@@ -1599,10 +1770,7 @@ function OnPropertyChanged(name)
             log(LVL.INFO, "Camera selected: %s (%s)", tostring(v), tostring(id))
             -- UpdateProperty does not re-enter OnPropertyChanged (documented),
             -- so apply the change here rather than relying on a callback.
-            g.cameraId = id
-            g.rtspEnableTried = false
-            g.lastSeen = {}
-            g.aliases = { Low = "", Medium = "", High = "" }
+            setCameraId(id)
             C4:UpdateProperty("Camera ID", id)
             fetchAliases()
         elseif not id and v ~= NO_CAMERA then
@@ -1616,9 +1784,7 @@ function OnPropertyChanged(name)
             -- and Properties is walked in undefined order.
             g.cameraId = newId
         elseif newId ~= g.cameraId then
-            g.cameraId = newId
-            g.lastSeen = {}
-            g.aliases = { Low = "", Medium = "", High = "" }
+            setCameraId(newId)
             if g.cameraId ~= "" then fetchAliases() end
         end
     elseif name == "RTSP Alias - Low" then
@@ -1676,6 +1842,10 @@ function OnPropertyChanged(name)
         end
     end
 
+    if name == "NVR Address" or name == "API Key" or name == "Camera" or name == "Camera ID" then
+        ensurePolling()
+    end
+
     -- Stream URLs may have changed; tell navigators to drop cached ones.
     if name:find("RTSP Alias") or name == "NVR Address" or name == "Preferred Quality" then
         C4:SendToProxy(CAMERA_BINDING, "DYNAMIC_URLS_CHANGED", {}, "NOTIFY")
@@ -1697,6 +1867,10 @@ function OnDriverInit()
 end
 
 function OnDriverLateInit()
+    -- Without a seed every driver instance draws the same "random" numbers, so
+    -- the jitter below would line all cameras up instead of spreading them.
+    pcall(function() math.randomseed(os.time() + C4:GetDeviceID() * 7919) end)
+
     -- Explicit order: logging first so startup is visible, then connection
     -- settings, then the camera, then its aliases. pairs() order is undefined
     -- and a bad order silently discards stored aliases.
@@ -1738,24 +1912,40 @@ function OnDriverLateInit()
     pushPortsToProxy()
     C4:SetTimer(5000,  function() pushPortsToProxy() end)
     C4:SetTimer(30000, function() pushPortsToProxy() end)
-    if g.address ~= "" then
-        pushAddressToProxy()
-        -- Repopulate the dropdown; the list itself does not persist across restarts.
-        discoverCameras(true)
-    end
-    if g.cameraId ~= "" and not haveAlias then
-        log(LVL.INFO, "No stored aliases - fetching from Protect")
-        fetchAliases()
-    end
+    if g.address ~= "" then pushAddressToProxy() end
     startSnapshotServer()
-    if validate() then
-        testConnection()
-        startPolling()
+
+    -- Every camera driver on the controller loads at the same instant, and
+    -- eight of them each asking the console twice at once is what tripped its
+    -- rate limit. Spread the requests over a few seconds, one kind per timer.
+    if g.address ~= "" then
+        -- Repopulate the dropdown; the list itself does not persist across restarts.
+        C4:SetTimer(math.random(250, 4000), function() discoverCameras(true) end)
+    end
+    if g.cameraId ~= "" then
+        C4:SetTimer(math.random(4500, 9000), function()
+            if haveAlias then
+                -- Stored tokens may be stale if Protect rotated them.
+                fetchAliases(true)
+            else
+                log(LVL.INFO, "No stored aliases - fetching from Protect")
+                fetchAliases()
+            end
+        end)
+    elseif g.address ~= "" and g.apiKey ~= "" then
+        C4:SetTimer(math.random(250, 4000), function() testConnection() end)
+    end
+    -- Polling needs no aliases; start it whenever address, key and camera are known.
+    if g.pollInterval == 0 then
+        startPolling()      -- records "polling off" in API Call Rate
+    else
+        ensurePolling()
     end
 end
 
 function OnDriverDestroyed()
     if g.pollTimer then g.pollTimer:Cancel() end
+    if g.pollWatch then g.pollWatch:Cancel() end
     if g.reaperTimer then g.reaperTimer:Cancel() end
     if g.serverPort then C4:DestroyServer(g.serverPort) end
     g.snapData = nil

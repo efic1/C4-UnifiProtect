@@ -863,5 +863,469 @@ test("diagnostics runs without error", function()
 end)
 
 --=============================================================================
+print("\nPolling, recovery and load (v47)")
+--=============================================================================
+
+local FULL_PROPS = { ["NVR Address"] = "192.0.2.10", ["API Key"] = "K", ["Camera ID"] = "CAM1",
+                     ["RTSP Alias - Low"] = "LOW" }
+
+local function pollCount(st, id)
+    local n = 0
+    for _, r in ipairs(st.requests) do
+        if r.method == "GET" and r.url:find("/cameras/" .. (id or "CAM1") .. "$") then n = n + 1 end
+    end
+    return n
+end
+
+local function countOf(list, v)
+    local n = 0
+    for _, x in ipairs(list) do if x == v then n = n + 1 end end
+    return n
+end
+
+local function tick(st) st.fireTimers(); st.flush() end
+
+-- Like tick, but leaves the 7 s event hold timer alone, so activity that
+-- continues across polls stays inside one hold window.
+local function tickHolding(st)
+    st.fireTimers(function(t) return t.ms ~= 7000 end)
+    st.flush()
+end
+local HOLD7 = { ["Event Hold Time"] = "7" }
+local function withFull(extra)
+    local p = {}
+    for k, v in pairs(FULL_PROPS) do p[k] = v end
+    for k, v in pairs(extra or {}) do p[k] = v end
+    return p
+end
+
+local function camBody(o)
+    o = o or {}
+    local parts = {}
+    if o.state ~= false then parts[#parts + 1] = string.format('"state":"%s"', o.state or "CONNECTED") end
+    parts[#parts + 1] = '"id":"' .. (o.id or "CAM1") .. '"'
+    parts[#parts + 1] = '"name":"' .. (o.name or "Front") .. '"'
+    parts[#parts + 1] = '"lastMotion":' .. (o.motion or 0)
+    parts[#parts + 1] = '"lastRing":' .. (o.ring or 0)
+    return "{" .. table.concat(parts, ",") .. "}"
+end
+
+local function aliasRoute(map)
+    return function(method, url)
+        if method ~= "GET" then return 200, "{}" end
+        local id = url:match("cameras/(%w+)/rtsps%-stream")
+        return 200, string.format('{"low":"rtsps://h:7441/%s"}', map[id] or "TOK")
+    end
+end
+
+-- Props as Composer would have stored them, applied by OnDriverLateInit (not
+-- through OnPropertyChanged), so the load path is what gets exercised.
+local function loaded(routes, props, async)
+    local st = stub.new({ routes = routes or {}, async = async })
+    st.load(CAM .. "driver.lua")
+    st.props["Log Mode"] = "Off"
+    st.props["Event Polling Interval"] = "5 Seconds"
+    for k, v in pairs(props or {}) do st.props[k] = v end
+    OnDriverLateInit()
+    return st
+end
+
+local FULL = FULL_PROPS
+
+-- A camera created by the setup driver loaded with nothing configured, then
+-- received its configuration. Nothing started polling until the next reload.
+test("polling starts when the setup driver configures a new camera", function()
+    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody() end,
+                        ["rtsps%-stream"] = aliasRoute({}) })
+    eq(pollCount(st), 0, "polls before config")
+    ExecuteCommand("SET_PROTECT_CONFIG", { address = "192.0.2.10", api_key = "K",
+        camera_id = "CAM1", camera_name = "Front", snapshots = "Off", enable_rtsp = "Yes" })
+    tick(st); tick(st)
+    truthy(pollCount(st) >= 1, "event poll issued after configuration")
+end)
+
+-- Same gap, configured by hand in Composer.
+test("polling starts when address, key and camera are entered by hand", function()
+    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody() end,
+        ["rtsps%-stream"] = aliasRoute({}),
+        ["/cameras$"] = { body = '{"cameras":[{"id":"CAM1","name":"Front"}]}' } })
+    st.set("NVR Address", "192.0.2.10"); st.set("API Key", "K")
+    ExecuteCommand("LUA_ACTION", { ACTION = "DiscoverCameras" }); st.flush()
+    st.set("Camera", "Front"); st.flush()
+    tick(st); tick(st)
+    truthy(pollCount(st) >= 1, "event poll issued")
+end)
+
+-- Events do not need streams. Boot polling was gated on a stored RTSP alias,
+-- so a camera with RTSP off (or unreachable at boot) never reported events.
+test("polling does not wait for an RTSP alias", function()
+    local props = { ["NVR Address"] = "192.0.2.10", ["API Key"] = "K", ["Camera ID"] = "CAM1",
+                    ["Enable RTSP Automatically"] = "No" }
+    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody() end,
+                        ["rtsps%-stream"] = { code = 404 } }, props)
+    tick(st); tick(st)
+    truthy(pollCount(st) >= 1, "event poll issued without an alias")
+end)
+
+test("polling stays off when the interval is Off", function()
+    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody() end },
+        { ["NVR Address"] = "192.0.2.10", ["API Key"] = "K", ["Camera ID"] = "CAM1",
+          ["Event Polling Interval"] = "Off" })
+    tick(st); tick(st)
+    eq(pollCount(st), 0, "polls with polling Off")
+end)
+
+-- Camera drivers all load together; the console's rate limit was tripped by
+-- sixteen requests in one instant. Startup requests wait for a timer.
+test("startup does not hit the console synchronously", function()
+    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody() end,
+                        ["rtsps%-stream"] = aliasRoute({}),
+                        ["/cameras$"] = { body = '{"cameras":[]}' } }, FULL)
+    eq(#st.requests, 0, "requests issued inside OnDriverLateInit")
+    tick(st)
+    truthy(#st.requests > 0, "requests follow once the startup timers fire")
+end)
+
+-- One exception while handling a reply used to end polling for good, because
+-- the next tick is only scheduled after the handler returns.
+test("an error while handling a reply does not end polling", function()
+    local m = 1000
+    local st = loaded({ ["cameras/CAM1$"] = function() m = m + 1000; return 200, camBody({ motion = m }) end }, FULL)
+    tick(st)                                   -- baseline poll
+    local before = pollCount(st)
+    local realFire = st.C4.FireEvent
+    st.C4.FireEvent = function() error("simulated Director fault") end
+    tick(st)                                   -- this reply makes the handler throw
+    st.C4.FireEvent = realFire
+    tick(st)
+    truthy(pollCount(st) > before + 1, "polling continued after the fault")
+end)
+
+-- If OnDone is never delivered, nothing ever scheduled the next poll and
+-- polling stopped without a trace.
+test("a poll that never gets a reply is abandoned and polling resumes", function()
+    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody() end }, FULL, true)
+    st.fireTimers()                                   -- first poll goes out; its reply is never flushed
+    eq(pollCount(st), 1, "first poll")
+    st.fireTimers(function(t) return t.ms == 60000 end)   -- the stall watchdog
+    st.fireTimers()                                   -- the poll it rescheduled
+    eq(pollCount(st), 2, "a new poll after the stall")
+    st.flush()                                        -- the abandoned reply finally lands: harmless
+    truthy(pollCount(st) >= 2, "still polling")
+end)
+
+--=============================================================================
+print("\nCamera changes with requests in flight")
+--=============================================================================
+
+-- Selecting CAM2 while CAM1's alias request was in flight let CAM1's late
+-- reply overwrite CAM2's stream token: wrong video, no error.
+test("a late alias reply for the previous camera is discarded", function()
+    local st = loaded({ ["rtsps%-stream"] = aliasRoute({ CAM1 = "AAAA", CAM2 = "BBBB" }) },
+        { ["NVR Address"] = "192.0.2.10", ["API Key"] = "K", ["Camera ID"] = "CAM1" }, true)
+    st.pending = {}
+    fetchAliases()
+    local first = st.pending; st.pending = {}        -- CAM1's request, in flight
+    st.set("Camera ID", "CAM2")                      -- the switch issues CAM2's own request
+    local second = st.pending; st.pending = {}
+    for _, f in ipairs(second) do f() end            -- CAM2's reply arrives first...
+    for _, f in ipairs(first) do f() end             -- ...then CAM1's, late
+    eq(st.props["RTSP Alias - Low"], "BBBB", "stored Low alias")
+    contains(UIRequest("GET_RTSP_H264_QUERY_STRING", { SIZE_X = 640 }), "BBBB", "token served")
+end)
+
+test("switching camera clears the old camera's tokens", function()
+    local st = configured({ ["rtsps%-stream"] = { code = 429 } })
+    truthy(st.props["RTSP Alias - Low"] ~= "", "precondition: alias present")
+    st.set("Camera ID", "CAM2")
+    eq(st.props["RTSP Alias - Low"], "", "Low alias after switching")
+end)
+
+-- A poll issued for the old camera must not report state for the new one.
+test("a late poll reply for the previous camera is ignored", function()
+    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody({ name = "OldCamera" }) end },
+        { ["NVR Address"] = "192.0.2.10", ["API Key"] = "K", ["Camera ID"] = "CAM1",
+          ["RTSP Alias - Low"] = "LOW" }, true)
+    st.fireTimers()                            -- poll for CAM1 goes out
+    local old = st.pending; st.pending = {}
+    st.set("Camera ID", "CAM2")
+    for _, f in ipairs(old) do f() end         -- its reply lands after the switch
+    truthy(st.props["Camera Name"] ~= "OldCamera", "name taken from the old camera's reply")
+end)
+
+--=============================================================================
+print("\nStatus recovery")
+--=============================================================================
+
+local function failingTransport(st, state)
+    local orig = st.C4.url
+    st.C4.url = function(self)
+        local o = orig(self)
+        local get = o.Get
+        o.Get = function(o2, url, h)
+            if state.fail then o2._done(o2, nil, 28, "timeout"); return o2 end
+            return get(o2, url, h)
+        end
+        return o
+    end
+end
+
+-- Any single quiet-poll timeout set "Unreachable", which then never cleared.
+test("one poll timeout does not report the console unreachable", function()
+    local st = configured({ ["cameras/CAM1$"] = function() return 200, camBody() end })
+    st.set("Event Polling Interval", "5 Seconds")
+    local state = { fail = true }
+    failingTransport(st, state)
+    poll()
+    truthy(st.props["Driver Status"] ~= "Unreachable - check NVR Address", "after one timeout")
+end)
+
+test("Unreachable clears when the console answers again", function()
+    local st = configured({ ["cameras/CAM1$"] = function() return 200, camBody() end,
+                            ["meta/info"] = { body = '{"applicationVersion":"6.0"}' } })
+    st.set("Event Polling Interval", "5 Seconds")
+    local state = { fail = true }
+    failingTransport(st, state)
+    for _ = 1, 3 do poll(); st.fireTimers() end
+    eq(st.props["Driver Status"], "Unreachable - check NVR Address", "after a streak of timeouts")
+    state.fail = false
+    poll(); st.fireTimers(); st.flush()
+    truthy(st.props["Driver Status"] ~= "Unreachable - check NVR Address", "after the console answers")
+end)
+
+-- "Auth Failed" outlived the fix: the key handler only stored the new value.
+test("Auth Failed clears when the API key is corrected", function()
+    local code = 401
+    local st = configured({ ["meta/info"] = function() return code, '{"applicationVersion":"6.0"}' end })
+    ExecuteCommand("LUA_ACTION", { ACTION = "TestConnection" })
+    eq(st.props["Driver Status"], "Auth Failed - check API Key", "with a bad key")
+    code = 200
+    st.set("API Key", "GOODKEY")
+    truthy(st.props["Driver Status"] ~= "Auth Failed - check API Key", "after fixing the key")
+end)
+
+--=============================================================================
+print("\nEvent edge cases")
+--=============================================================================
+
+-- A reply missing 'state' reported the camera offline, then online again.
+test("a reply without a connection state is ignored", function()
+    local body = camBody()
+    local st = loaded({ ["cameras/CAM1$"] = function() return 200, body end }, FULL)
+    tick(st)
+    body = '{"id":"CAM1"}'
+    tick(st); tick(st)
+    eq(countOf(st.events, 8), 0, "offline events")
+    eq(countOf(st.events, 9), 0, "online events")
+end)
+
+-- A truncated reply must not set a zero baseline that makes history look new.
+test("a truncated reply does not replay old motion", function()
+    local body = '{"id":"CAM1"}'                   -- the very first reply is truncated
+    local st = loaded({ ["cameras/CAM1$"] = function() return 200, body end }, FULL)
+    tick(st)
+    body = camBody({ motion = 5000 }); tick(st)     -- full reply: history, not news
+    tick(st)
+    eq(countOf(st.events, 1), 0, "motion events from replayed history")
+end)
+
+-- With lastRing at 0 at load, the first real ring was taken as the baseline.
+test("the first ring on a doorbell that has never rung fires", function()
+    local ring = 0
+    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody({ ring = ring }) end }, FULL)
+    tick(st)
+    ring = 2000000
+    tick(st)
+    eq(countOf(st.events, 7), 1, "doorbell events for the first ring")
+end)
+
+test("history present at load is not replayed", function()
+    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody({ ring = 999, motion = 999 }) end }, FULL)
+    tick(st); tick(st)
+    eq(countOf(st.events, 7), 0, "doorbell")
+    eq(countOf(st.events, 1), 0, "motion")
+end)
+
+-- Protect keeps advancing lastMotion while motion continues; each advance
+-- fired "motion started" again and made Director re-run programming.
+test("sustained motion fires one event, not one per poll", function()
+    local m = 1000
+    local st = loaded({ ["cameras/CAM1$"] = function() m = m + 1000; return 200, camBody({ motion = m }) end },
+        withFull(HOLD7))
+    for _ = 1, 6 do tickHolding(st) end
+    eq(countOf(st.events, 1), 1, "motion-start events during one episode")
+end)
+
+test("motion fires again once the hold window has cleared it", function()
+    local m = 1000
+    local st = loaded({ ["cameras/CAM1$"] = function() m = m + 1000; return 200, camBody({ motion = m }) end },
+        withFull(HOLD7))
+    tickHolding(st); tickHolding(st)
+    eq(countOf(st.events, 1), 1, "first episode")
+    st.fireTimers(function(t) return t.ms == 7000 end)   -- only the hold-window timer
+    eq(st.vars["MOTION_DETECTED"], "false", "variable cleared")
+    tick(st)
+    eq(countOf(st.events, 1), 2, "second episode")
+end)
+
+test("every doorbell ring fires, even inside the hold window", function()
+    local ring = 1000
+    local st = loaded({ ["cameras/CAM1$"] = function() ring = ring + 1000; return 200, camBody({ ring = ring }) end },
+        withFull(HOLD7))
+    tickHolding(st); tickHolding(st); tickHolding(st)
+    truthy(countOf(st.events, 7) >= 2, "doorbell events for consecutive rings")
+end)
+
+-- g.online started false, so every restart announced "camera online".
+test("a restart does not announce the camera as online", function()
+    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody() end }, FULL)
+    tick(st); tick(st)
+    eq(countOf(st.events, 9), 0, "online events at startup")
+end)
+
+test("going offline then online fires both events once", function()
+    local state = "CONNECTED"
+    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody({ state = state }) end,
+                        ["rtsps%-stream"] = aliasRoute({}) }, FULL)
+    tick(st)
+    state = "DISCONNECTED"; tick(st)
+    state = "CONNECTED"; tick(st); tick(st)
+    eq(countOf(st.events, 8), 1, "offline events")
+    eq(countOf(st.events, 9), 1, "online events")
+end)
+
+--=============================================================================
+print("\nStream tokens")
+--=============================================================================
+
+-- Tokens were only fetched when none were stored, so ones Protect had since
+-- rotated were served until someone ran Fetch Stream Aliases.
+test("stored tokens are refreshed at startup", function()
+    local st = loaded({ ["rtsps%-stream"] = aliasRoute({ CAM1 = "FRESH" }),
+                        ["/cameras$"] = { body = '{"cameras":[]}' } },
+        { ["NVR Address"] = "192.0.2.10", ["API Key"] = "K", ["Camera ID"] = "CAM1",
+          ["RTSP Alias - Low"] = "STALE", ["Event Polling Interval"] = "Off" })
+    tick(st)
+    eq(st.props["RTSP Alias - Low"], "FRESH", "alias after the startup refresh")
+end)
+
+-- Refreshing must never be the reason RTSP gets switched on in Protect.
+test("a startup refresh does not enable RTSP in Protect", function()
+    local st = loaded({ ["rtsps%-stream"] = { code = 404 }, ["/cameras$"] = { body = '{"cameras":[]}' } },
+        { ["NVR Address"] = "192.0.2.10", ["API Key"] = "K", ["Camera ID"] = "CAM1",
+          ["RTSP Alias - Low"] = "STALE", ["Enable RTSP Automatically"] = "Yes",
+          ["Event Polling Interval"] = "Off" })
+    tick(st); tick(st)
+    for _, r in ipairs(st.requests) do
+        truthy(r.method ~= "POST", "unexpected POST " .. r.url)
+    end
+end)
+
+test("tokens are re-read when a camera comes back online", function()
+    local state = "CONNECTED"
+    local st = loaded({ ["cameras/CAM1$"] = function() return 200, camBody({ state = state }) end,
+                        ["rtsps%-stream"] = aliasRoute({ CAM1 = "ROTATED" }) }, FULL)
+    tick(st)
+    state = "DISCONNECTED"; tick(st)
+    state = "CONNECTED"; tick(st); tick(st)
+    eq(st.props["RTSP Alias - Low"], "ROTATED", "alias after reconnect")
+end)
+
+--=============================================================================
+print("\nSnapshot listener")
+--=============================================================================
+
+local function snapshotSetup(routes)
+    local st = loaded(routes, { ["NVR Address"] = "192.0.2.10", ["API Key"] = "K", ["Camera ID"] = "CAM1",
+        ["RTSP Alias - Low"] = "LOW", ["Snapshots"] = "On", ["Event Polling Interval"] = "Off" }, true)
+    OnServerStatusChanged(4000, "ONLINE", "snapshot")
+    local replies = {}
+    st.C4.ServerSend = function(_, h, data) replies[#replies + 1] = { handle = h, data = data } end
+    return st, replies
+end
+
+local function statusOf(r) return r.data:match("^HTTP/1.1 (%d+)") end
+
+-- A second request while the first fetch was running got a 503 whenever the
+-- cache was empty, which is exactly when Navigator opens several at once.
+test("simultaneous requests with an empty cache are all served", function()
+    local st, replies = snapshotSetup({ ["snapshot"] = function() return 200, string.rep("J", 2000) end })
+    OnServerDataIn(1, "GET /snapshot.jpg HTTP/1.1\r\n\r\n")
+    OnServerDataIn(2, "GET /snapshot.jpg HTTP/1.1\r\n\r\n")
+    st.flush()
+    eq(#replies, 2, "replies")
+    eq(statusOf(replies[1]), "200", "first")
+    eq(statusOf(replies[2]), "200", "second")
+end)
+
+test("a failed fetch with nothing cached answers 503", function()
+    local st, replies = snapshotSetup({ ["snapshot"] = { code = 500 } })
+    OnServerDataIn(1, "GET /snapshot.jpg HTTP/1.1\r\n\r\n")
+    st.flush()
+    eq(statusOf(replies[1]), "503", "status")
+end)
+
+-- "Stale beats blank" had no limit: a failing console kept serving the same
+-- frame indefinitely, hiding the outage.
+test("a frame older than a minute is not served when the refresh fails", function()
+    local now, code = 7000000, 200
+    local realTime = os.time
+    os.time = function() return now end
+    local ok, err = pcall(function()
+        local st, replies = snapshotSetup({ ["snapshot"] = function() return code, string.rep("J", 2000) end })
+        OnServerDataIn(1, "GET /snapshot.jpg HTTP/1.1\r\n\r\n"); st.flush()
+        eq(statusOf(replies[1]), "200", "fresh fetch")
+        code = 500
+        now = now + 30
+        OnServerDataIn(2, "GET /snapshot.jpg HTTP/1.1\r\n\r\n"); st.flush()
+        eq(statusOf(replies[2]), "200", "30s-old frame still served")
+        now = now + 61
+        OnServerDataIn(3, "GET /snapshot.jpg HTTP/1.1\r\n\r\n"); st.flush()
+        eq(statusOf(replies[3]), "503", "91s-old frame refused")
+    end)
+    os.time = realTime
+    if not ok then error(err, 0) end
+end)
+
+-- A frame fetched for the previous camera landed after the switch and was
+-- served as the new camera's picture.
+test("a snapshot in flight for the previous camera is not served", function()
+    local st, replies = snapshotSetup({
+        ["snapshot"] = function(m, url) return 200, url:find("CAM2") and "IMG-CAM2" or "IMG-CAM1" end })
+    OnServerDataIn(1, "GET /snapshot.jpg HTTP/1.1\r\n\r\n")      -- fetch for CAM1 in flight
+    local old = st.pending; st.pending = {}
+    st.set("Camera ID", "CAM2")
+    for _, f in ipairs(old) do f() end                            -- stale reply lands
+    OnServerDataIn(2, "GET /snapshot.jpg HTTP/1.1\r\n\r\n"); st.flush()
+    local last = replies[#replies]
+    contains(last.data, "IMG-CAM2", "frame served after the switch")
+    truthy(not last.data:find("IMG-CAM1", 1, true), "old camera's frame")
+end)
+
+-- Configuration arriving before the listener reported ONLINE created a second
+-- listener; the first, whose port was not yet known, could never be destroyed.
+test("configuration during listener start-up does not create a second listener", function()
+    local st = stub.new()
+    st.load(CAM .. "driver.lua")
+    st.props["Log Mode"] = "Off"; st.props["Snapshots"] = "On"
+    OnDriverLateInit()
+    ExecuteCommand("SET_PROTECT_CONFIG", { address = "192.0.2.10", api_key = "K",
+        camera_id = "CAM1", snapshots = "On" })
+    eq(#st.servers, 1, "CreateServer calls after config")
+    st.set("Controller Address", "192.0.2.99")        -- also routes straight to startSnapshotServer
+    eq(#st.servers, 1, "CreateServer calls after a property change")
+end)
+
+test("a listener that comes up after Snapshots was switched off is destroyed", function()
+    local st = stub.new()
+    st.load(CAM .. "driver.lua")
+    st.props["Log Mode"] = "Off"; st.props["Snapshots"] = "On"
+    OnDriverLateInit()
+    st.set("Snapshots", "Off")
+    OnServerStatusChanged(4001, "ONLINE", "snapshot")
+    eq(st.destroyed[#st.destroyed], 4001, "port destroyed")
+end)
+
+--=============================================================================
 print(string.format("\n%d passed, %d failed\n", passed, failed))
 os.exit(failed == 0 and 0 or 1)
