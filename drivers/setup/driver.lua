@@ -15,7 +15,7 @@
          none, and push configuration to all of them
 --]]
 
-local DRIVER_VERSION = "4"
+local DRIVER_VERSION = "5"
 local CAMERA_DRIVER   = "unifi_protect_camera.c4z"
 local PERSIST_MANAGED = "managed_cameras"     -- camera_id -> device_id
 local ADOPT_WAIT_MS   = 3000

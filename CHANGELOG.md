@@ -3,7 +3,7 @@
 Versions are the integer in each driver's `<version>`, which Composer uses to compare updates.
 Earlier development builds are summarised rather than listed individually.
 
-## Camera driver 47 / Setup driver 4
+## Camera driver 48 / Setup driver 5
 
 Found in a code review for edge cases and controller load. Each item has a regression test.
 
